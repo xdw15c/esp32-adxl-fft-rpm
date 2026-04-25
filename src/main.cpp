@@ -1,12 +1,25 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <Adafruit_ADXL345_U.h>
-#include <U8g2lib.h>
 #include "secrets.h"
 
-// ─── Konfiguracja ────────────────────────────────────────────────────────────
+#if ENABLE_OLED || ENABLE_ADXL
+#include <Wire.h>
+#endif
+#if ENABLE_ADXL
+#include <Adafruit_ADXL345_U.h>
+#endif
+#if ENABLE_OLED
+#include <U8g2lib.h>
+#endif
+
+// ─── Domyślne wartości (można nadpisać przez build_flags) ───────────────────
+#ifndef ENABLE_OLED
+#define ENABLE_OLED 0
+#endif
+#ifndef ENABLE_ADXL
+#define ENABLE_ADXL 0
+#endif
 #ifndef CONFIG_SDA_PIN
 #define CONFIG_SDA_PIN  8
 #endif
@@ -29,21 +42,25 @@
 #define CONFIG_WIFI_RETRY_MS 10000
 #endif
 
-// Inicjalizacja serwera WWW na porcie 80
 WebServer server(80);
 
+#if ENABLE_ADXL
 static float g_lastX = 0.0f;
 static float g_lastY = 0.0f;
 static float g_lastZ = 0.0f;
 static float g_lastMag = 0.0f;
 static unsigned long g_samples = 0;
-static unsigned long g_lastHeartbeatMs = 0;
 static unsigned long g_lastSensorLogMs = 0;
+#endif
+static unsigned long g_lastHeartbeatMs = 0;
 static unsigned long g_lastWifiRetryMs = 0;
 static wl_status_t g_prevWifiStatus = WL_NO_SHIELD;
 
+#if ENABLE_OLED
 static void oledMsg(const char* line1, const char* line2 = nullptr);
+#endif
 
+#if ENABLE_OLED || ENABLE_ADXL
 static void scanI2CBus() {
     Serial.println("[I2C] Scanning bus...");
     uint8_t found = 0;
@@ -61,6 +78,7 @@ static void scanI2CBus() {
         Serial.printf("[I2C] Scan done, devices=%u\n", found);
     }
 }
+#endif
 
 static const char* wifiStatusName(wl_status_t status) {
     switch (status) {
@@ -80,14 +98,15 @@ static void logStatusSnapshot(const char* tag) {
     const bool wifiOk = (WiFi.status() == WL_CONNECTED);
     const String ip = wifiOk ? WiFi.localIP().toString() : String("-");
     const int rssi = wifiOk ? WiFi.RSSI() : 0;
+#if ENABLE_ADXL
     Serial.printf("[STATUS][%s] uptime=%lu ms wifi=%s ip=%s rssi=%d dBm samples=%lu vib=%.2f\n",
-                  tag,
-                  millis(),
-                  wifiStatusName(WiFi.status()),
-                  ip.c_str(),
-                  rssi,
-                  g_samples,
-                  g_lastMag);
+                  tag, millis(), wifiStatusName(WiFi.status()),
+                  ip.c_str(), rssi, g_samples, g_lastMag);
+#else
+    Serial.printf("[STATUS][%s] uptime=%lu ms wifi=%s ip=%s rssi=%d dBm heap=%u\n",
+                  tag, millis(), wifiStatusName(WiFi.status()),
+                  ip.c_str(), rssi, ESP.getFreeHeap());
+#endif
 }
 
 static bool ensureWebAuth() {
@@ -104,23 +123,27 @@ static bool ensureWebAuth() {
 }
 
 static void handleStatusJson() {
-        if (!ensureWebAuth()) return;
+    if (!ensureWebAuth()) return;
 
-        char json[320];
-        const bool wifiOk = (WiFi.status() == WL_CONNECTED);
-        snprintf(json,
-                         sizeof(json),
-                         "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,\"samples\":%lu,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"vibration\":%.3f}",
-                         millis(),
-                         wifiOk ? "true" : "false",
-                         wifiOk ? WiFi.localIP().toString().c_str() : "-",
-                         wifiOk ? WiFi.RSSI() : 0,
-                         g_samples,
-                         g_lastX,
-                         g_lastY,
-                         g_lastZ,
-                         g_lastMag);
-        server.send(200, "application/json", json);
+    const bool wifiOk = (WiFi.status() == WL_CONNECTED);
+    char json[320];
+#if ENABLE_ADXL
+    snprintf(json, sizeof(json),
+             "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,"
+             "\"samples\":%lu,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"vibration\":%.3f}",
+             millis(), wifiOk ? "true" : "false",
+             wifiOk ? WiFi.localIP().toString().c_str() : "-",
+             wifiOk ? WiFi.RSSI() : 0,
+             g_samples, g_lastX, g_lastY, g_lastZ, g_lastMag);
+#else
+    snprintf(json, sizeof(json),
+             "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,\"heap\":%u}",
+             millis(), wifiOk ? "true" : "false",
+             wifiOk ? WiFi.localIP().toString().c_str() : "-",
+             wifiOk ? WiFi.RSSI() : 0,
+             ESP.getFreeHeap());
+#endif
+    server.send(200, "application/json", json);
 }
 
 static void handleRoot() {
@@ -231,38 +254,43 @@ static void handleRoot() {
 }
 
 static void connectWiFi() {
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-        oledMsg("Laczenie Wi-Fi...", WIFI_SSID);
+#if ENABLE_OLED
+    oledMsg("Laczenie Wi-Fi...", WIFI_SSID);
+#endif
     Serial.printf("[WIFI] Connecting to SSID: %s\n", WIFI_SSID);
 
-        const unsigned long startMs = millis();
-        while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < CONFIG_WIFI_TIMEOUT_MS) {
-                delay(250);
-                Serial.print('.');
-        }
-        Serial.println();
+    const unsigned long startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < CONFIG_WIFI_TIMEOUT_MS) {
+        delay(250);
+        Serial.print('.');
+    }
+    Serial.println();
 
-        if (WiFi.status() == WL_CONNECTED) {
-                String ip = WiFi.localIP().toString();
-            Serial.printf("[WIFI] Connected, IP: %s RSSI: %d dBm\n", ip.c_str(), WiFi.RSSI());
-                oledMsg("Wi-Fi OK", ip.c_str());
-        } else {
-            Serial.printf("[WIFI] Connection timeout after %u ms, running offline\n", CONFIG_WIFI_TIMEOUT_MS);
-                oledMsg("Wi-Fi timeout", "Tryb offline");
-        }
+    if (WiFi.status() == WL_CONNECTED) {
+        String ip = WiFi.localIP().toString();
+        Serial.printf("[WIFI] Connected, IP: %s RSSI: %d dBm\n", ip.c_str(), WiFi.RSSI());
+#if ENABLE_OLED
+        oledMsg("Wi-Fi OK", ip.c_str());
+#endif
+    } else {
+        Serial.printf("[WIFI] Connection timeout after %u ms, running offline\n", CONFIG_WIFI_TIMEOUT_MS);
+#if ENABLE_OLED
+        oledMsg("Wi-Fi timeout", "Tryb offline");
+#endif
+    }
 
-        g_prevWifiStatus = WiFi.status();
+    g_prevWifiStatus = WiFi.status();
 }
 
+#if ENABLE_OLED
 // ─── Wyświetlacz OLED SH1106 128×64 na HW I2C ────────────────────────────────
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 
-// ─── Czujnik ADXL345 ─────────────────────────────────────────────────────────
-Adafruit_ADXL345_Unified accel(12345);
-
-// ─── Pomocnicze: komunikat na OLED ───────────────────────────────────────────
 static void oledMsg(const char* line1, const char* line2) {
     display.clearBuffer();
     display.setFont(u8g2_font_6x10_tf);
@@ -270,6 +298,12 @@ static void oledMsg(const char* line1, const char* line2) {
     if (line2) display.drawStr(0, 26, line2);
     display.sendBuffer();
 }
+#endif  // ENABLE_OLED
+
+#if ENABLE_ADXL
+// ─── Czujnik ADXL345 ─────────────────────────────────────────────────────────
+Adafruit_ADXL345_Unified accel(12345);
+#endif  // ENABLE_ADXL
 
 void setup() {
     Serial.begin(115200);
@@ -278,34 +312,42 @@ void setup() {
     Serial.println("==== ESP32-C3 ADXL345 START ====");
     Serial.printf("[BOOT] Build date: %s %s\n", __DATE__, __TIME__);
 
+#if ENABLE_OLED || ENABLE_ADXL
     // I2C na GPIO8/9
     Wire.begin(CONFIG_SDA_PIN, CONFIG_SCL_PIN);
-    Serial.printf("[I2C] SDA=%d SCL=%d OLED_ADDR=0x%02X\n", CONFIG_SDA_PIN, CONFIG_SCL_PIN, CONFIG_OLED_ADDR);
+    Serial.printf("[I2C] SDA=%d SCL=%d\n", CONFIG_SDA_PIN, CONFIG_SCL_PIN);
     scanI2CBus();
+#endif
 
+#if ENABLE_OLED
     // ── OLED init ──────────────────────────────────────────────────────────
     display.setI2CAddress(CONFIG_OLED_ADDR << 1);  // U8g2 oczekuje adresu 8-bit
     display.begin();
     display.setContrast(128);
     oledMsg("ESP32-C3 ADXL345", "Inicjalizacja...");
     Serial.println("[OLED] Ready");
+#endif
 
+#if ENABLE_ADXL
     // ── ADXL345 init ───────────────────────────────────────────────────────
     if (!accel.begin()) {
         Serial.println("[ADXL] ERROR: sensor not found");
+#if ENABLE_OLED
         oledMsg("ADXL345 BLAD", "Sprawdz I2C");
+#endif
         while (true) { delay(1000); }
     }
     accel.setRange(ADXL345_RANGE_16_G);
     accel.setDataRate(ADXL345_DATARATE_800_HZ);
     Serial.println("[ADXL] Initialized: range=16G odr=800Hz");
 
-    sensors_event_t event;
-    accel.getEvent(&event);
+    sensors_event_t firstEvent;
+    accel.getEvent(&firstEvent);
     Serial.printf("[ADXL] First sample X=%.2f Y=%.2f Z=%.2f m/s2\n",
-                  event.acceleration.x,
-                  event.acceleration.y,
-                  event.acceleration.z);
+                  firstEvent.acceleration.x,
+                  firstEvent.acceleration.y,
+                  firstEvent.acceleration.z);
+#endif
 
     connectWiFi();
 
@@ -326,13 +368,16 @@ void setup() {
 
     logStatusSnapshot("setup-done");
 
+#if ENABLE_OLED
     oledMsg("ADXL345 OK", "HTTP gotowy");
     delay(1500);
+#endif
 }
 
 void loop() {
     server.handleClient();
 
+#if ENABLE_ADXL
     sensors_event_t event;
     accel.getEvent(&event);
 
@@ -341,6 +386,7 @@ void loop() {
     g_lastZ = event.acceleration.z;
     g_lastMag = sqrtf(g_lastX * g_lastX + g_lastY * g_lastY + g_lastZ * g_lastZ);
     g_samples++;
+#endif
 
     const wl_status_t wifiStatus = WiFi.status();
     if (wifiStatus != g_prevWifiStatus) {
@@ -358,28 +404,36 @@ void loop() {
         WiFi.reconnect();
     }
 
+#if ENABLE_ADXL
     if ((nowMs - g_lastSensorLogMs) >= CONFIG_SENSOR_LOG_MS) {
         g_lastSensorLogMs = nowMs;
         Serial.printf("[SENSOR] X=%+6.2f Y=%+6.2f Z=%+6.2f V=%.2f m/s2\n", g_lastX, g_lastY, g_lastZ, g_lastMag);
     }
+#endif
 
     if ((nowMs - g_lastHeartbeatMs) >= CONFIG_HEARTBEAT_MS) {
         g_lastHeartbeatMs = nowMs;
         logStatusSnapshot("heartbeat");
     }
 
-    // ── Wyświetl na OLED ───────────────────────────────────────────────────
+#if ENABLE_OLED
     char buf[32];
     display.clearBuffer();
     display.setFont(u8g2_font_6x10_tf);
-
+#if ENABLE_ADXL
     display.drawStr(0, 10, "Wibracje [m/s2]");
-    snprintf(buf, sizeof(buf), "X: %+6.2f", g_lastX);     display.drawStr(0, 24, buf);
-    snprintf(buf, sizeof(buf), "Y: %+6.2f", g_lastY);     display.drawStr(0, 36, buf);
-    snprintf(buf, sizeof(buf), "Z: %+6.2f", g_lastZ);     display.drawStr(0, 48, buf);
-    snprintf(buf, sizeof(buf), "V: %6.2f", g_lastMag);    display.drawStr(0, 62, buf);
-
+    snprintf(buf, sizeof(buf), "X: %+6.2f", g_lastX);  display.drawStr(0, 24, buf);
+    snprintf(buf, sizeof(buf), "Y: %+6.2f", g_lastY);  display.drawStr(0, 36, buf);
+    snprintf(buf, sizeof(buf), "Z: %+6.2f", g_lastZ);  display.drawStr(0, 48, buf);
+    snprintf(buf, sizeof(buf), "V: %6.2f",  g_lastMag); display.drawStr(0, 62, buf);
+#else
+    snprintf(buf, sizeof(buf), "heap: %u B", ESP.getFreeHeap());
+    display.drawStr(0, 12, "ESP32-C3");
+    display.drawStr(0, 28, buf);
+#endif  // ENABLE_ADXL
     display.sendBuffer();
-
-    delay(200);  // ~5 Hz dla celów testowych; docelowo: ciągły odczyt @ ODR
+    delay(200);
+#else
+    delay(2);
+#endif  // ENABLE_OLED
 }
