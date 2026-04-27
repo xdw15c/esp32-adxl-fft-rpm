@@ -7,6 +7,7 @@
 #include <Wire.h>
 #endif
 #if ENABLE_ADXL
+#include <SPI.h>
 #include <Adafruit_ADXL345_U.h>
 #endif
 #if ENABLE_OLED
@@ -28,6 +29,18 @@
 #endif
 #ifndef CONFIG_OLED_ADDR
 #define CONFIG_OLED_ADDR 0x3C
+#endif
+#ifndef CONFIG_ADXL_SPI_CS_PIN
+#define CONFIG_ADXL_SPI_CS_PIN 5
+#endif
+#ifndef CONFIG_ADXL_SPI_SCK_PIN
+#define CONFIG_ADXL_SPI_SCK_PIN 18
+#endif
+#ifndef CONFIG_ADXL_SPI_MOSI_PIN
+#define CONFIG_ADXL_SPI_MOSI_PIN 23
+#endif
+#ifndef CONFIG_ADXL_SPI_MISO_PIN
+#define CONFIG_ADXL_SPI_MISO_PIN 19
 #endif
 #ifndef CONFIG_WIFI_TIMEOUT_MS
 #define CONFIG_WIFI_TIMEOUT_MS 15000
@@ -60,7 +73,7 @@ static wl_status_t g_prevWifiStatus = WL_NO_SHIELD;
 static void oledMsg(const char* line1, const char* line2 = nullptr);
 #endif
 
-#if ENABLE_OLED || ENABLE_ADXL
+#if ENABLE_OLED
 static void scanI2CBus() {
     Serial.println("[I2C] Scanning bus...");
     uint8_t found = 0;
@@ -302,7 +315,12 @@ static void oledMsg(const char* line1, const char* line2) {
 
 #if ENABLE_ADXL
 // ─── Czujnik ADXL345 ─────────────────────────────────────────────────────────
-Adafruit_ADXL345_Unified accel(12345);
+Adafruit_ADXL345_Unified accel(
+    CONFIG_ADXL_SPI_SCK_PIN,
+    CONFIG_ADXL_SPI_MISO_PIN,
+    CONFIG_ADXL_SPI_MOSI_PIN,
+    CONFIG_ADXL_SPI_CS_PIN,
+    12345);
 #endif  // ENABLE_ADXL
 
 void setup() {
@@ -312,7 +330,7 @@ void setup() {
     Serial.println("==== ESP32-C3 ADXL345 START ====");
     Serial.printf("[BOOT] Build date: %s %s\n", __DATE__, __TIME__);
 
-#if ENABLE_OLED || ENABLE_ADXL
+#if ENABLE_OLED
     // I2C na GPIO8/9
     Wire.begin(CONFIG_SDA_PIN, CONFIG_SCL_PIN);
     Serial.printf("[I2C] SDA=%d SCL=%d\n", CONFIG_SDA_PIN, CONFIG_SCL_PIN);
@@ -333,13 +351,17 @@ void setup() {
     if (!accel.begin()) {
         Serial.println("[ADXL] ERROR: sensor not found");
 #if ENABLE_OLED
-        oledMsg("ADXL345 BLAD", "Sprawdz I2C");
+    oledMsg("ADXL345 BLAD", "Sprawdz SPI");
 #endif
         while (true) { delay(1000); }
     }
     accel.setRange(ADXL345_RANGE_16_G);
     accel.setDataRate(ADXL345_DATARATE_800_HZ);
-    Serial.println("[ADXL] Initialized: range=16G odr=800Hz");
+    Serial.printf("[ADXL] Initialized SPI: CS=%d SCK=%d MOSI=%d MISO=%d range=16G odr=800Hz\n",
+          CONFIG_ADXL_SPI_CS_PIN,
+          CONFIG_ADXL_SPI_SCK_PIN,
+          CONFIG_ADXL_SPI_MOSI_PIN,
+          CONFIG_ADXL_SPI_MISO_PIN);
 
     sensors_event_t firstEvent;
     accel.getEvent(&firstEvent);
