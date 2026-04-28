@@ -1160,7 +1160,7 @@ static void handleRoot() {
             <h3>ODR czujnika [Hz]</h3>
             <p>Czestotliwosc probkowania ADXL345 i jednoczesnie Fs analizy FFT. Wieksze ODR daje szersze pasmo, mniejsze ODR poprawia rozdzielczosc czestotliwosci dla aktualnie ustawionego N.</p>
             <h3>FFT N</h3>
-            <p>Liczba probek okna FFT. Wieksze N poprawia rozdzielczosc czestotliwosci, ale wydluza czas jednego okna i opoznia odswiezanie.</p>
+            <p>Liczba probek okna FFT. Wieksze N poprawia rozdzielczosc czestotliwosci, ale wyraznie zwieksza opoznienie i koszt obliczen. Uzywaj z glowa: zwiekszaj stopniowo (np. 256 -&gt; 512 -&gt; 1024) i obserwuj CPU oraz plynosc odswiezania.</p>
             <h3>Trend [s]</h3>
             <p>Zakres czasu historii wykresu RMS. Parametr ustawiany tylko przez WWW, zakres 5..60 sekund.</p>
             <div class="modal-actions">
@@ -1212,7 +1212,7 @@ static void handleRoot() {
             harmTol: 'Przeliczona tolerancja jednostronna: bins * Fs / N [Hz].',
             harmWinHz: 'Pelne okno analizy harmonicznej: 2 * tolerancja [Hz].',
             odrSelect: 'Konfigurowana czestotliwosc probkowania ADXL345 [Hz].',
-            fftNSelect: 'Aktywna liczba probek okna FFT (N).',
+            fftNSelect: 'Aktywna liczba probek okna FFT (N). Wieksze N = lepsza rozdzielczosc, ale wieksze opoznienie i obciazenie CPU. Uzywaj z glowa.',
             trendSec: 'Zakres czasu historii trendu RMS [s], tylko przez WWW (max 60).',
             fftRes2: 'Rozdzielczosc FFT wynikajaca z bieżącego Fs i N [Hz/bin].',
             fftFs: 'Aktualne Fs analizy FFT [Hz].',
