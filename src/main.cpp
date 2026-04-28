@@ -92,6 +92,12 @@
 #ifndef CONFIG_TREND_THRESHOLD_PCT
 #define CONFIG_TREND_THRESHOLD_PCT 20
 #endif
+#ifndef CONFIG_HARM_RATIO_THRESH_PCT
+#define CONFIG_HARM_RATIO_THRESH_PCT 30
+#endif
+#ifndef CONFIG_HARM_MAX_ORDER
+#define CONFIG_HARM_MAX_ORDER 4
+#endif
 
 WebServer server(80);
 #if ENABLE_MODBUS
@@ -146,6 +152,10 @@ static uint16_t g_winSampleCount = 0;
 static uint16_t g_fftIdx = 0;
 static float g_hpfPrevIn = 0.0f;
 static float g_hpfPrevOut = 0.0f;
+static float g_harmonicAmp[3] = {0.0f, 0.0f, 0.0f};  // index 0=2x, 1=3x, 2=4x of fundamental
+static uint8_t g_harmonicAlarmFlags = 0;               // bits: 0=2x active, 1=3x active, 2=4x active, 3=multiple
+static uint8_t g_harmRatioThreshPct = CONFIG_HARM_RATIO_THRESH_PCT;
+static uint8_t g_harmMaxOrder = CONFIG_HARM_MAX_ORDER;
 
 static ArduinoFFT<float> g_fft(g_fftReal, g_fftImag, CONFIG_FFT_SIZE, (float)CONFIG_FFT_FS);
 
@@ -172,6 +182,39 @@ static int16_t clampToI16(long value) {
     return (int16_t)value;
 }
 
+// Searches g_fftMag[] for energy at 2x, 3x, 4x of fundHz relative to the fundamental peak.
+// Sets g_harmonicAmp[0..2] and g_harmonicAlarmFlags bits.
+static void computeHarmonics(float fundHz) {
+    const float binHz = (float)CONFIG_FFT_FS / (float)CONFIG_FFT_SIZE;
+    const uint16_t halfN = CONFIG_FFT_SIZE / 2;
+    g_harmonicAlarmFlags = 0;
+    uint8_t harmCount = 0;
+    for (uint8_t k = 2; k <= g_harmMaxOrder && k <= 4; k++) {
+        const uint8_t idx = k - 2;  // 2x->0, 3x->1, 4x->2
+        const float targetHz = (float)k * fundHz;
+        if (targetHz >= (float)(CONFIG_FFT_FS / 2)) {
+            g_harmonicAmp[idx] = 0.0f;
+            continue;
+        }
+        const uint16_t centerBin = (uint16_t)(targetHz / binHz);
+        const uint16_t lo = (centerBin > 2) ? (centerBin - 2) : 1;
+        const uint16_t hi = min((uint16_t)(centerBin + 2), (uint16_t)(halfN - 1));
+        float maxAmp = 0.0f;
+        for (uint16_t i = lo; i <= hi; i++) {
+            if (g_fftMag[i] > maxAmp) maxAmp = g_fftMag[i];
+        }
+        g_harmonicAmp[idx] = maxAmp;
+        const float ratio = (g_fftPeakAmp > 1e-6f) ? (maxAmp / g_fftPeakAmp) : 0.0f;
+        if (ratio * 100.0f > (float)g_harmRatioThreshPct) {
+            harmCount++;
+            g_harmonicAlarmFlags |= (uint8_t)(1u << idx);
+        }
+    }
+    if (harmCount >= 2) {
+        g_harmonicAlarmFlags |= (uint8_t)(1u << 3);  // multiple harmonics
+    }
+}
+
 static void updateAlarmFlags() {
     g_alarmFlags = 0;
     if (clampToU16(lroundf(g_rmsTotal * 10.0f)) > g_rmsAlarmThresholdX10) {
@@ -184,6 +227,8 @@ static void updateAlarmFlags() {
     if (!g_sensorPresent) {
         g_alarmFlags |= 1u << 4;
     }
+    // bits 5-8: harmonic alarms (shifted from g_harmonicAlarmFlags bits 0-3)
+    g_alarmFlags |= (uint16_t)(g_harmonicAlarmFlags << 5);
 }
 
 static void computeFFT() {
@@ -256,8 +301,13 @@ static void computeFFT() {
 
     if (g_fftPeakConfidencePct >= g_peakConfThreshPct) {
         g_fftPeakRpm = (g_fftPeakHzFilt * 60.0f) / max<uint16_t>(1, g_rpmOrder);
+        computeHarmonics(g_fftPeakHzFilt);
     } else {
         g_fftPeakRpm = 0.0f;
+        g_harmonicAlarmFlags = 0;
+        g_harmonicAmp[0] = 0.0f;
+        g_harmonicAmp[1] = 0.0f;
+        g_harmonicAmp[2] = 0.0f;
     }
 
     updateAlarmFlags();
@@ -332,6 +382,10 @@ static uint16_t modbusReadInputRegister(uint16_t addr, bool& ok) {
         case 13: return clampToU16(lroundf(g_fftPeakAmp * 10.0f));
         case 14: return CONFIG_FFT_FS;
         case 15: return g_sensorPresent ? 0 : 1;
+        case 16: return clampToU16(lroundf(g_harmonicAmp[0] * 100.0f));  // 2x amp x100
+        case 17: return clampToU16(lroundf(g_harmonicAmp[1] * 100.0f));  // 3x amp x100
+        case 18: return clampToU16(lroundf(g_harmonicAmp[2] * 100.0f));  // 4x amp x100
+        case 19: return g_harmonicAlarmFlags;  // bits: 0=2x, 1=3x, 2=4x, 3=multiple
         default:
             ok = false;
             return 0;
@@ -347,6 +401,8 @@ static uint16_t modbusReadHoldingRegister(uint16_t addr, bool& ok) {
         case 103: return g_fftBandMinHz;
         case 104: return g_fftBandMaxHz;
         case 105: return g_rpmOrder;
+        case 106: return g_harmRatioThreshPct;
+        case 107: return g_harmMaxOrder;
         default:
             ok = false;
             return 0;
@@ -374,6 +430,13 @@ static bool modbusWriteHoldingRegister(uint16_t addr, uint16_t value) {
             return true;
         case 105:
             g_rpmOrder = max<uint16_t>(1, value);
+            return true;
+        case 106:
+            g_harmRatioThreshPct = (uint8_t)min<uint16_t>(value, 100);
+            if (g_harmRatioThreshPct < 1) g_harmRatioThreshPct = 1;
+            return true;
+        case 107:
+            g_harmMaxOrder = (uint8_t)constrain((int)value, 2, 4);
             return true;
         default:
             return false;
@@ -562,12 +625,18 @@ static void handleConfigJson() {
         if (v > 100) v = 100;
         g_peakConfThreshPct = (uint8_t)v;
         Serial.printf("[CFG] peak_confidence_threshold_pct=%u\n", g_peakConfThreshPct);
+    } else if (server.hasArg("harm_ratio_thresh_pct")) {
+        int v = server.arg("harm_ratio_thresh_pct").toInt();
+        if (v < 1) v = 1;
+        if (v > 100) v = 100;
+        g_harmRatioThreshPct = (uint8_t)v;
+        Serial.printf("[CFG] harm_ratio_thresh_pct=%u\n", g_harmRatioThreshPct);
     }
 
-    char json[96];
+    char json[128];
     snprintf(json, sizeof(json),
-             "{\"peak_confidence_threshold_pct\":%u}",
-             g_peakConfThreshPct);
+             "{\"peak_confidence_threshold_pct\":%u,\"harm_ratio_thresh_pct\":%u,\"harm_max_order\":%u}",
+             g_peakConfThreshPct, g_harmRatioThreshPct, g_harmMaxOrder);
     server.send(200, "application/json", json);
 }
 
@@ -679,7 +748,13 @@ static void handleRoot() {
                 <span class="label">Prog pewnosci bledu odczytu [%]</span>
                 <input id="errThr" type="number" min="0" max="100" step="1" value="60" />
                 <button id="saveErrThr" type="button">Zapisz</button>
-                <span class="muted">Pewność: <span class="mono" id="errConf">0</span>%</span>
+                <span class="muted">Pewnosc: <span class="mono" id="errConf">0</span>%</span>
+            </div>
+            <div class="cfg-row">
+                <span class="label">Prog amplitudy harmonicznej [%]</span>
+                <input id="harmThr" type="number" min="1" max="100" step="1" value="30" />
+                <button id="saveHarmThr" type="button">Zapisz</button>
+                <span class="muted">Harmoniczne: <span class="mono" id="harmStatus">-</span></span>
             </div>
         </div>
 
@@ -696,6 +771,7 @@ static void handleRoot() {
         const fctx = fc.getContext('2d');
         let peakConfidenceThresholdPct = 60;
         let peakConfidencePct = 0;
+        let harmRatioThreshPct = 30;
 
         async function saveErrorThreshold() {
             const raw = Number($('errThr').value);
@@ -707,6 +783,20 @@ static void handleRoot() {
                 const d = await r.json();
                 peakConfidenceThresholdPct = Number(d.peak_confidence_threshold_pct || val);
                 $('errThr').value = String(peakConfidenceThresholdPct);
+            } catch (_) {
+            }
+        }
+
+        async function saveHarmThreshold() {
+            const raw = Number($('harmThr').value);
+            const val = Number.isFinite(raw) ? Math.max(1, Math.min(100, Math.round(raw))) : harmRatioThreshPct;
+            $('harmThr').value = String(val);
+            try {
+                const r = await fetch('/api/config?harm_ratio_thresh_pct=' + val, { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const d = await r.json();
+                harmRatioThreshPct = Number(d.harm_ratio_thresh_pct || val);
+                $('harmThr').value = String(harmRatioThreshPct);
             } catch (_) {
             }
         }
@@ -815,6 +905,37 @@ static void handleRoot() {
                 fctx.fillStyle = '#ef4444';
                 fctx.textAlign = 'left';
                 fctx.fillText(d.peak_hz.toFixed(1) + ' Hz', Math.min(peakX + 4, W - 56), 12);
+
+                // Harmonic markers (2x, 3x, 4x)
+                const harmAmps = d.harmonic_amps || [0, 0, 0];
+                const harmAlarm = d.harmonic_alarm_flags || 0;
+                if (typeof d.harm_ratio_thresh_pct === 'number') {
+                    harmRatioThreshPct = d.harm_ratio_thresh_pct;
+                    $('harmThr').value = String(harmRatioThreshPct);
+                }
+                const harmLabels = ['2x', '3x', '4x'];
+                const harmStatus = [];
+                fctx.font = '10px sans-serif';
+                for (let k = 0; k < 3; k++) {
+                    const harmHz = (k + 2) * d.peak_hz;
+                    if (harmHz >= d.fs / 2) continue;
+                    const hx = (harmHz / (d.fs / 2)) * W;
+                    const active = harmAlarm & (1 << k);
+                    fctx.strokeStyle = active ? 'rgba(234,179,8,0.9)' : 'rgba(74,222,128,0.55)';
+                    fctx.lineWidth = 1;
+                    fctx.setLineDash([4, 3]);
+                    fctx.beginPath();
+                    fctx.moveTo(hx, 0);
+                    fctx.lineTo(hx, yBase);
+                    fctx.stroke();
+                    fctx.setLineDash([]);
+                    fctx.fillStyle = active ? '#ca8a04' : '#16a34a';
+                    fctx.textAlign = 'center';
+                    fctx.fillText(harmLabels[k], hx, 34);
+                    if (active) harmStatus.push(harmLabels[k]);
+                }
+                $('harmStatus').textContent = harmStatus.length ? harmStatus.join(' ') + ' !' : 'brak';
+                $('harmStatus').style.color = harmStatus.length ? '#ca8a04' : '#16a34a';
             } catch (_) {
             }
         }
@@ -822,6 +943,7 @@ static void handleRoot() {
         refreshStatus();
         refreshFFT();
         $('saveErrThr').addEventListener('click', saveErrorThreshold);
+        $('saveHarmThr').addEventListener('click', saveHarmThreshold);
         setInterval(refreshStatus, 1000);
         setInterval(refreshFFT, 600);
     </script>
@@ -1041,7 +1163,15 @@ void loop() {
     snprintf(buf, sizeof(buf), "Y: %+6.2f", g_lastY); display.drawStr(0, 24, buf);
     snprintf(buf, sizeof(buf), "Z: %+6.2f", g_lastZ); display.drawStr(0, 36, buf);
     snprintf(buf, sizeof(buf), "RPM: %6.0f", g_fftPeakRpm); display.drawStr(0, 48, buf);
-    snprintf(buf, sizeof(buf), "CONF:%5.0f%%", g_fftPeakConfidencePct); display.drawStr(0, 62, buf);
+    if (g_harmonicAlarmFlags & 0x07u) {
+        char hbuf[16] = "HARM:";
+        if (g_harmonicAlarmFlags & 1u) strcat(hbuf, "2x");
+        if (g_harmonicAlarmFlags & 2u) strcat(hbuf, "3x");
+        if (g_harmonicAlarmFlags & 4u) strcat(hbuf, "4x");
+        display.drawStr(0, 62, hbuf);
+    } else {
+        snprintf(buf, sizeof(buf), "CONF:%5.0f%%", g_fftPeakConfidencePct); display.drawStr(0, 62, buf);
+    }
 #else
         snprintf(buf, sizeof(buf), "heap: %u B", ESP.getFreeHeap());
         display.drawStr(0, 12, "ESP32-C3");
