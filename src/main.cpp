@@ -20,6 +20,9 @@
 #ifndef ENABLE_ADXL
 #define ENABLE_ADXL 0
 #endif
+#ifndef ENABLE_MODBUS
+#define ENABLE_MODBUS 0
+#endif
 #ifndef CONFIG_SDA_PIN
 #define CONFIG_SDA_PIN 8
 #endif
@@ -74,13 +77,39 @@
 #ifndef CONFIG_READ_ERROR_CONF_THRESH_PCT
 #define CONFIG_READ_ERROR_CONF_THRESH_PCT 60
 #endif
+#ifndef CONFIG_MODBUS_PORT
+#define CONFIG_MODBUS_PORT 502
+#endif
+#ifndef CONFIG_MODBUS_UNIT_ID
+#define CONFIG_MODBUS_UNIT_ID 1
+#endif
+#ifndef CONFIG_RMS_ALARM_THRESHOLD_X10
+#define CONFIG_RMS_ALARM_THRESHOLD_X10 110
+#endif
+#ifndef CONFIG_SPIKE_N
+#define CONFIG_SPIKE_N 5
+#endif
+#ifndef CONFIG_TREND_THRESHOLD_PCT
+#define CONFIG_TREND_THRESHOLD_PCT 20
+#endif
 
 WebServer server(80);
+#if ENABLE_MODBUS
+WiFiServer modbusServer(CONFIG_MODBUS_PORT);
+#endif
 
 static unsigned long g_lastHeartbeatMs = 0;
 static unsigned long g_lastWifiRetryMs = 0;
 static wl_status_t g_prevWifiStatus = WL_NO_SHIELD;
 static uint8_t g_peakConfThreshPct = CONFIG_READ_ERROR_CONF_THRESH_PCT;
+static uint16_t g_rmsAlarmThresholdX10 = CONFIG_RMS_ALARM_THRESHOLD_X10;
+static uint16_t g_spikeN = CONFIG_SPIKE_N;
+static uint16_t g_trendThresholdPct = CONFIG_TREND_THRESHOLD_PCT;
+static uint16_t g_fftBandMinHz = (uint16_t)CONFIG_FFT_PEAK_MIN_HZ;
+static uint16_t g_fftBandMaxHz = (uint16_t)CONFIG_FFT_PEAK_MAX_HZ;
+static uint16_t g_rpmOrder = (uint16_t)CONFIG_RPM_ORDER;
+static uint16_t g_alarmFlags = 0;
+static bool g_sensorPresent = ENABLE_ADXL != 0;
 
 #if ENABLE_OLED
 static unsigned long g_lastOledMs = 0;
@@ -106,6 +135,14 @@ static float g_fftPeakHzFilt = 0.0f;
 static float g_fftPeakAmp = 0.0f;
 static float g_fftPeakRpm = 0.0f;
 static float g_fftPeakConfidencePct = 0.0f;
+static float g_rmsX = 0.0f;
+static float g_rmsY = 0.0f;
+static float g_rmsZ = 0.0f;
+static float g_rmsTotal = 0.0f;
+static float g_winSumSqX = 0.0f;
+static float g_winSumSqY = 0.0f;
+static float g_winSumSqZ = 0.0f;
+static uint16_t g_winSampleCount = 0;
 static uint16_t g_fftIdx = 0;
 static float g_hpfPrevIn = 0.0f;
 static float g_hpfPrevOut = 0.0f;
@@ -118,6 +155,36 @@ Adafruit_ADXL345_Unified accel(
     CONFIG_ADXL_SPI_MOSI_PIN,
     CONFIG_ADXL_SPI_CS_PIN,
     12345);
+
+static float ms2ToMg(float valueMs2) {
+    return valueMs2 * (1000.0f / 9.80665f);
+}
+
+static uint16_t clampToU16(long value) {
+    if (value < 0) return 0;
+    if (value > 65535L) return 65535;
+    return (uint16_t)value;
+}
+
+static int16_t clampToI16(long value) {
+    if (value < -32768L) return -32768;
+    if (value > 32767L) return 32767;
+    return (int16_t)value;
+}
+
+static void updateAlarmFlags() {
+    g_alarmFlags = 0;
+    if (clampToU16(lroundf(g_rmsTotal * 10.0f)) > g_rmsAlarmThresholdX10) {
+        g_alarmFlags |= 1u << 0;
+    }
+    if (g_fftPeakConfidencePct >= g_peakConfThreshPct &&
+        (g_fftPeakHzFilt < (float)g_fftBandMinHz || g_fftPeakHzFilt > (float)g_fftBandMaxHz)) {
+        g_alarmFlags |= 1u << 3;
+    }
+    if (!g_sensorPresent) {
+        g_alarmFlags |= 1u << 4;
+    }
+}
 
 static void computeFFT() {
     float mean = 0.0f;
@@ -137,8 +204,8 @@ static void computeFFT() {
 
     const float binHz = (float)CONFIG_FFT_FS / (float)CONFIG_FFT_SIZE;
     const uint16_t halfN = CONFIG_FFT_SIZE / 2;
-    uint16_t minBin = (uint16_t)(CONFIG_FFT_PEAK_MIN_HZ / binHz);
-    uint16_t maxBin = (uint16_t)(CONFIG_FFT_PEAK_MAX_HZ / binHz);
+    uint16_t minBin = (uint16_t)((float)g_fftBandMinHz / binHz);
+    uint16_t maxBin = (uint16_t)((float)g_fftBandMaxHz / binHz);
     if (minBin < 1) minBin = 1;
     if (maxBin >= (halfN - 1)) maxBin = halfN - 1;
     const float norm = 2.0f / (float)CONFIG_FFT_SIZE;
@@ -188,10 +255,12 @@ static void computeFFT() {
     g_fftPeakConfidencePct = 0.85f * g_fftPeakConfidencePct + 0.15f * confNow;
 
     if (g_fftPeakConfidencePct >= g_peakConfThreshPct) {
-        g_fftPeakRpm = (g_fftPeakHzFilt * 60.0f) / CONFIG_RPM_ORDER;
+        g_fftPeakRpm = (g_fftPeakHzFilt * 60.0f) / max<uint16_t>(1, g_rpmOrder);
     } else {
         g_fftPeakRpm = 0.0f;
     }
+
+    updateAlarmFlags();
 }
 #endif
 
@@ -242,6 +311,201 @@ static void logStatusSnapshot(const char* tag) {
                   tag, millis(), wifiStatusName(WiFi.status()), ip.c_str(), rssi, ESP.getFreeHeap());
 #endif
 }
+
+#if ENABLE_MODBUS
+static uint16_t modbusReadInputRegister(uint16_t addr, bool& ok) {
+    ok = true;
+    switch (addr) {
+        case 0: return (uint16_t)clampToI16(lroundf(ms2ToMg(g_lastX) / 3.9f));
+        case 1: return (uint16_t)clampToI16(lroundf(ms2ToMg(g_lastY) / 3.9f));
+        case 2: return (uint16_t)clampToI16(lroundf(ms2ToMg(g_lastZ) / 3.9f));
+        case 3: return (uint16_t)clampToI16(lroundf(ms2ToMg(g_lastX)));
+        case 4: return (uint16_t)clampToI16(lroundf(ms2ToMg(g_lastY)));
+        case 5: return (uint16_t)clampToI16(lroundf(ms2ToMg(g_lastZ)));
+        case 6: return clampToU16(lroundf(ms2ToMg(g_rmsX) * 10.0f));
+        case 7: return clampToU16(lroundf(ms2ToMg(g_rmsY) * 10.0f));
+        case 8: return clampToU16(lroundf(ms2ToMg(g_rmsZ) * 10.0f));
+        case 9: return clampToU16(lroundf(ms2ToMg(g_rmsTotal) * 10.0f));
+        case 10: return g_alarmFlags;
+        case 11: return 0;
+        case 12: return clampToU16(lroundf(g_fftPeakHzFilt));
+        case 13: return clampToU16(lroundf(g_fftPeakAmp * 10.0f));
+        case 14: return CONFIG_FFT_FS;
+        case 15: return g_sensorPresent ? 0 : 1;
+        default:
+            ok = false;
+            return 0;
+    }
+}
+
+static uint16_t modbusReadHoldingRegister(uint16_t addr, bool& ok) {
+    ok = true;
+    switch (addr) {
+        case 100: return g_rmsAlarmThresholdX10;
+        case 101: return g_spikeN;
+        case 102: return g_trendThresholdPct;
+        case 103: return g_fftBandMinHz;
+        case 104: return g_fftBandMaxHz;
+        case 105: return g_rpmOrder;
+        default:
+            ok = false;
+            return 0;
+    }
+}
+
+static bool modbusWriteHoldingRegister(uint16_t addr, uint16_t value) {
+    switch (addr) {
+        case 100:
+            g_rmsAlarmThresholdX10 = value;
+            return true;
+        case 101:
+            g_spikeN = max<uint16_t>(1, value);
+            return true;
+        case 102:
+            g_trendThresholdPct = value;
+            return true;
+        case 103:
+            if (value >= g_fftBandMaxHz) return false;
+            g_fftBandMinHz = value;
+            return true;
+        case 104:
+            if (value <= g_fftBandMinHz) return false;
+            g_fftBandMaxHz = value;
+            return true;
+        case 105:
+            g_rpmOrder = max<uint16_t>(1, value);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void modbusPutU16(uint8_t* dst, uint16_t value) {
+    dst[0] = (uint8_t)(value >> 8);
+    dst[1] = (uint8_t)(value & 0xFF);
+}
+
+static void modbusSendException(WiFiClient& client, uint16_t txId, uint8_t unitId, uint8_t function, uint8_t exceptionCode) {
+    uint8_t resp[9] = {0};
+    modbusPutU16(&resp[0], txId);
+    modbusPutU16(&resp[2], 0);
+    modbusPutU16(&resp[4], 3);
+    resp[6] = unitId;
+    resp[7] = (uint8_t)(function | 0x80u);
+    resp[8] = exceptionCode;
+    client.write(resp, sizeof(resp));
+}
+
+static void modbusSendReadResponse(WiFiClient& client, uint16_t txId, uint8_t unitId, uint8_t function, const uint16_t* regs, uint16_t quantity) {
+    const uint16_t byteCount = quantity * 2;
+    uint8_t resp[9 + 125 * 2] = {0};
+    modbusPutU16(&resp[0], txId);
+    modbusPutU16(&resp[2], 0);
+    modbusPutU16(&resp[4], (uint16_t)(3 + byteCount));
+    resp[6] = unitId;
+    resp[7] = function;
+    resp[8] = (uint8_t)byteCount;
+    for (uint16_t i = 0; i < quantity; i++) {
+        modbusPutU16(&resp[9 + i * 2], regs[i]);
+    }
+    client.write(resp, 9 + byteCount);
+}
+
+static void modbusSendWriteSingleResponse(WiFiClient& client, uint16_t txId, uint8_t unitId, uint16_t addr, uint16_t value) {
+    uint8_t resp[12] = {0};
+    modbusPutU16(&resp[0], txId);
+    modbusPutU16(&resp[2], 0);
+    modbusPutU16(&resp[4], 6);
+    resp[6] = unitId;
+    resp[7] = 6;
+    modbusPutU16(&resp[8], addr);
+    modbusPutU16(&resp[10], value);
+    client.write(resp, sizeof(resp));
+}
+
+static void handleModbusRequest(WiFiClient& client) {
+    if (client.available() < 7) return;
+
+    uint8_t header[7];
+    if (client.readBytes(header, sizeof(header)) != sizeof(header)) return;
+
+    const uint16_t txId = (uint16_t)((header[0] << 8) | header[1]);
+    const uint16_t protoId = (uint16_t)((header[2] << 8) | header[3]);
+    const uint16_t length = (uint16_t)((header[4] << 8) | header[5]);
+    const uint8_t unitId = header[6];
+    if (protoId != 0 || length < 2 || length > 253 || unitId != CONFIG_MODBUS_UNIT_ID) {
+        return;
+    }
+
+    const uint16_t pduLen = length - 1;
+    uint8_t pdu[253] = {0};
+    if (client.readBytes(pdu, pduLen) != pduLen) return;
+
+    const uint8_t function = pdu[0];
+    if (function == 3 || function == 4) {
+        if (pduLen < 5) {
+            modbusSendException(client, txId, unitId, function, 3);
+            return;
+        }
+        const uint16_t startAddr = (uint16_t)((pdu[1] << 8) | pdu[2]);
+        const uint16_t quantity = (uint16_t)((pdu[3] << 8) | pdu[4]);
+        if (quantity < 1 || quantity > 125) {
+            modbusSendException(client, txId, unitId, function, 3);
+            return;
+        }
+        uint16_t regs[125] = {0};
+        for (uint16_t i = 0; i < quantity; i++) {
+            bool ok = false;
+            regs[i] = (function == 4)
+                ? modbusReadInputRegister((uint16_t)(startAddr + i), ok)
+                : modbusReadHoldingRegister((uint16_t)(startAddr + i), ok);
+            if (!ok) {
+                modbusSendException(client, txId, unitId, function, 2);
+                return;
+            }
+        }
+        modbusSendReadResponse(client, txId, unitId, function, regs, quantity);
+        return;
+    }
+
+    if (function == 6) {
+        if (pduLen < 5) {
+            modbusSendException(client, txId, unitId, function, 3);
+            return;
+        }
+        const uint16_t addr = (uint16_t)((pdu[1] << 8) | pdu[2]);
+        const uint16_t value = (uint16_t)((pdu[3] << 8) | pdu[4]);
+        if (!modbusWriteHoldingRegister(addr, value)) {
+            modbusSendException(client, txId, unitId, function, 2);
+            return;
+        }
+        updateAlarmFlags();
+        modbusSendWriteSingleResponse(client, txId, unitId, addr, value);
+        return;
+    }
+
+    modbusSendException(client, txId, unitId, function, 1);
+}
+
+static void handleModbusTcp() {
+    static WiFiClient client;
+
+    if (!client || !client.connected()) {
+        if (client) client.stop();
+        client = modbusServer.available();
+        if (client) {
+            client.setTimeout(20);
+            Serial.printf("[MODBUS] Client connected: %s\n", client.remoteIP().toString().c_str());
+        }
+    }
+
+    if (client && client.connected()) {
+        while (client.available() >= 7) {
+            handleModbusRequest(client);
+        }
+    }
+}
+#endif
 
 static bool ensureWebAuth() {
 #if defined(WEB_USERNAME) && defined(WEB_PASSWORD)
@@ -328,11 +592,11 @@ static void handleFftJson() {
     resp += F(",\"rpm\":");
     resp += g_fftPeakRpm;
     resp += F(",\"rpm_order\":");
-    resp += CONFIG_RPM_ORDER;
+    resp += g_rpmOrder;
     resp += F(",\"band_min_hz\":");
-    resp += CONFIG_FFT_PEAK_MIN_HZ;
+    resp += g_fftBandMinHz;
     resp += F(",\"band_max_hz\":");
-    resp += CONFIG_FFT_PEAK_MAX_HZ;
+    resp += g_fftBandMaxHz;
     resp += F(",\"mag\":[");
     for (uint16_t i = 0; i < CONFIG_FFT_SIZE / 2; i++) {
         if (i) resp += ',';
@@ -636,11 +900,14 @@ void setup() {
 #if ENABLE_ADXL
     if (!accel.begin()) {
         Serial.println("[ADXL] ERROR: sensor not found");
+        g_sensorPresent = false;
 #if ENABLE_OLED
         oledMsg("ADXL345 BLAD", "Sprawdz SPI");
 #endif
         while (true) { delay(1000); }
     }
+
+    g_sensorPresent = true;
 
     accel.setRange(ADXL345_RANGE_16_G);
     accel.setDataRate(ADXL345_DATARATE_800_HZ);
@@ -661,10 +928,18 @@ void setup() {
     server.on("/api/config", HTTP_GET, handleConfigJson);
     server.begin();
 
+#if ENABLE_MODBUS
+    modbusServer.begin();
+    modbusServer.setNoDelay(true);
+#endif
+
     Serial.println("[HTTP] Server started on port 80");
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("[HTTP] Open: http://%s/\n", WiFi.localIP().toString().c_str());
     }
+#if ENABLE_MODBUS
+    Serial.printf("[MODBUS] Server started on port %u unit=%u\n", CONFIG_MODBUS_PORT, CONFIG_MODBUS_UNIT_ID);
+#endif
 
     logStatusSnapshot("setup-done");
 
@@ -676,6 +951,10 @@ void setup() {
 
 void loop() {
     server.handleClient();
+
+#if ENABLE_MODBUS
+    handleModbusTcp();
+#endif
 
 #if ENABLE_ADXL
     const uint32_t nowUs = micros();
@@ -689,6 +968,10 @@ void loop() {
         g_lastY = event.acceleration.y;
         g_lastZ = event.acceleration.z;
         g_lastMag = sqrtf(g_lastX * g_lastX + g_lastY * g_lastY + g_lastZ * g_lastZ);
+        g_winSumSqX += g_lastX * g_lastX;
+        g_winSumSqY += g_lastY * g_lastY;
+        g_winSumSqZ += g_lastZ * g_lastZ;
+        g_winSampleCount++;
         g_samples++;
 
         const float dt = 1.0f / (float)CONFIG_FFT_FS;
@@ -703,6 +986,16 @@ void loop() {
         g_fftIdx++;
         if (g_fftIdx >= CONFIG_FFT_SIZE) {
             g_fftIdx = 0;
+            if (g_winSampleCount > 0) {
+                g_rmsX = sqrtf(g_winSumSqX / g_winSampleCount);
+                g_rmsY = sqrtf(g_winSumSqY / g_winSampleCount);
+                g_rmsZ = sqrtf(g_winSumSqZ / g_winSampleCount);
+                g_rmsTotal = sqrtf(g_rmsX * g_rmsX + g_rmsY * g_rmsY + g_rmsZ * g_rmsZ);
+            }
+            g_winSumSqX = 0.0f;
+            g_winSumSqY = 0.0f;
+            g_winSumSqZ = 0.0f;
+            g_winSampleCount = 0;
             computeFFT();
         }
     }

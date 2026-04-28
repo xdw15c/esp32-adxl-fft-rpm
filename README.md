@@ -2,7 +2,7 @@
 
 ## Project Goal
 
-A motor health monitoring system based on vibration analysis. The ADXL345 accelerometer (**SPI** interface) is mounted on the motor housing and provides raw X/Y/Z acceleration data. The ESP32 (WROOM) collects 256 samples at Fs = 800 Hz, runs FFT with an HP filter and spectrum smoothing, identifies the dominant vibration frequency and estimates **RPM**. The firmware also calculates **peak confidence** (how clearly the FFT peak stands out from the noise floor). RPM is forced to `0` when peak confidence is below a configurable threshold. Results are served by a built-in HTTP server: a status page plus `/api/status`, `/api/fft`, and `/api/config` JSON endpoints. Optionally, a 1.3" OLED (SH1106, I²C) displays X/Y/Z and the detected peak frequency in Hz.
+A motor health monitoring system based on vibration analysis. The ADXL345 accelerometer (**SPI** interface) is mounted on the motor housing and provides raw X/Y/Z acceleration data. The ESP32 (WROOM) collects 256 samples at Fs = 800 Hz, runs FFT with an HP filter and spectrum smoothing, identifies the dominant vibration frequency and estimates **RPM**. The firmware also calculates **peak confidence** (how clearly the FFT peak stands out from the noise floor). RPM is forced to `0` when peak confidence is below a configurable threshold. Results are exposed through both a built-in HTTP server and a lightweight **Modbus TCP** server. The HTTP side provides a status page plus `/api/status`, `/api/fft`, and `/api/config` JSON endpoints, while Modbus TCP serves measurement and configuration registers on port `502`. Optionally, a 1.3" OLED (SH1106, I²C) displays X/Y/Z, RPM, and confidence.
 
 ---
 
@@ -68,9 +68,12 @@ I²C address: **0x3C** (configurable via `CONFIG_OLED_ADDR`).
 │   GET /api/status → JSON: X/Y/Z, IP, RPM, confidence │
 │   GET /api/fft    → JSON: mag[], peak_hz, conf, rpm  │
 │   GET /api/config → read/write confidence threshold  │
+│  [Modbus TCP server]                                 │
+│   FC04 → input registers: X/Y/Z, RMS, alarms, FFT   │
+│   FC03/FC06 → holding registers: runtime thresholds  │
 │         │                                            │
 │  [OLED – every 120 ms, non-blocking]                │
-│   - X / Y / Z [mg], P: peak_hz                      │
+│   - X / Y / Z, RPM, confidence                      │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -135,6 +138,22 @@ Compatibility alias is still accepted:
 
 ---
 
+## Modbus TCP
+
+The firmware includes a lightweight Modbus TCP server on port `502`.
+
+Supported function codes:
+
+- `FC 04` – Read Input Registers
+- `FC 03` – Read Holding Registers
+- `FC 06` – Write Single Holding Register
+
+Default unit ID: `1`
+
+The current implementation is single-client and intended for SCADA/HMI polling, PLC integration, and diagnostics.
+
+---
+
 ## Project Configuration (`platformio.ini`)
 
 ```ini
@@ -152,6 +171,7 @@ lib_deps =
 build_flags =
     -D ENABLE_OLED=1
     -D ENABLE_ADXL=1
+  -D ENABLE_MODBUS=1
     ; I2C / OLED
     -D CONFIG_SDA_PIN=21
     -D CONFIG_SCL_PIN=22
@@ -165,6 +185,9 @@ build_flags =
     ; FFT
     -D CONFIG_FFT_SIZE=256
     -D CONFIG_FFT_FS=800
+    ; Modbus TCP
+    -D CONFIG_MODBUS_PORT=502
+    -D CONFIG_MODBUS_UNIT_ID=1
     ; Timers
     -D CONFIG_WIFI_TIMEOUT_MS=15000
 ```
@@ -212,7 +235,7 @@ Template: `include/secrets.h.example`.
 | RPM estimation | ✅ working |
 | Web UI with canvas chart (log scale) | ✅ working |
 | `/api/status` + `/api/fft` | ✅ working |
-| Modbus TCP | ❌ not implemented |
+| Modbus TCP (`FC03`, `FC04`, `FC06`) | ✅ working |
 
 ---
 
@@ -229,9 +252,9 @@ Template: `include/secrets.h.example`.
 ## TODO
 
 ### Modbus TCP
-- [ ] Add Modbus TCP server on port 502 (eModbus library or custom implementation)
-- [ ] Input Registers (FC 04): X/Y/Z [mg], peak_hz, RPM, status
-- [ ] Holding Registers (FC 03/06): configurable alarm thresholds (runtime write)
+- [x] Add Modbus TCP server on port 502
+- [x] Input Registers (FC 04): X/Y/Z [mg], RMS, peak_hz, RPM, status
+- [x] Holding Registers (FC 03/06): configurable alarm thresholds (runtime write)
 - [ ] Alarm bits: RMS threshold exceeded, peak outside nominal range, sensor lost
 - [ ] Test integration with SCADA/HMI (e.g. Node-RED, Ignition, Codesys)
 
@@ -258,7 +281,7 @@ Template: `include/secrets.h.example`.
 
 ### Implementation Phases
 
-- [ ] **Phase 1** – Modbus TCP server, basic raw X/Y/Z + RMS registers
+- [x] **Phase 1** – Modbus TCP server, basic raw X/Y/Z + RMS registers
 - [ ] **Phase 2** – ring-buffer, spike detection, trend analysis, alarm bits
 - [ ] **Phase 3** – OLED: additional screens (RMS, alarms, IP)
 - [ ] **Phase 4** – FFT extension: vector magnitude, harmonics, bearing frequencies
