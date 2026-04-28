@@ -71,12 +71,16 @@
 #ifndef CONFIG_HPF_CUTOFF_HZ
 #define CONFIG_HPF_CUTOFF_HZ 2.0f
 #endif
+#ifndef CONFIG_READ_ERROR_CONF_THRESH_PCT
+#define CONFIG_READ_ERROR_CONF_THRESH_PCT 60
+#endif
 
 WebServer server(80);
 
 static unsigned long g_lastHeartbeatMs = 0;
 static unsigned long g_lastWifiRetryMs = 0;
 static wl_status_t g_prevWifiStatus = WL_NO_SHIELD;
+static uint8_t g_peakConfThreshPct = CONFIG_READ_ERROR_CONF_THRESH_PCT;
 
 #if ENABLE_OLED
 static unsigned long g_lastOledMs = 0;
@@ -101,6 +105,7 @@ static float g_fftPeakHz = 0.0f;
 static float g_fftPeakHzFilt = 0.0f;
 static float g_fftPeakAmp = 0.0f;
 static float g_fftPeakRpm = 0.0f;
+static float g_fftPeakConfidencePct = 0.0f;
 static uint16_t g_fftIdx = 0;
 static float g_hpfPrevIn = 0.0f;
 static float g_hpfPrevOut = 0.0f;
@@ -141,6 +146,8 @@ static void computeFFT() {
 
     uint16_t peakBin = minBin;
     float peakAmp = 0.0f;
+    float noiseSum = 0.0f;
+    uint16_t noiseCount = 0;
     g_fftMag[0] = 0.0f;
 
     for (uint16_t i = 1; i < halfN; i++) {
@@ -149,6 +156,13 @@ static void computeFFT() {
         if (i >= minBin && i <= maxBin && g_fftMag[i] > peakAmp) {
             peakAmp = g_fftMag[i];
             peakBin = i;
+        }
+    }
+
+    for (uint16_t i = minBin; i <= maxBin; i++) {
+        if (i + 1 < peakBin || i > peakBin + 1) {
+            noiseSum += g_fftMag[i];
+            noiseCount++;
         }
     }
 
@@ -167,7 +181,17 @@ static void computeFFT() {
     g_fftPeakHz = peakHz;
     g_fftPeakAmp = peakAmp;
     g_fftPeakHzFilt = 0.85f * g_fftPeakHzFilt + 0.15f * g_fftPeakHz;
-    g_fftPeakRpm = (g_fftPeakHzFilt * 60.0f) / CONFIG_RPM_ORDER;
+    const float noiseFloor = (noiseCount > 0) ? (noiseSum / (float)noiseCount) : 0.0f;
+    const float prominence = peakAmp / (noiseFloor + 1e-6f);
+    float confNow = ((prominence - 1.0f) / 7.0f) * 100.0f;
+    confNow = constrain(confNow, 0.0f, 100.0f);
+    g_fftPeakConfidencePct = 0.85f * g_fftPeakConfidencePct + 0.15f * confNow;
+
+    if (g_fftPeakConfidencePct >= g_peakConfThreshPct) {
+        g_fftPeakRpm = (g_fftPeakHzFilt * 60.0f) / CONFIG_RPM_ORDER;
+    } else {
+        g_fftPeakRpm = 0.0f;
+    }
 }
 #endif
 
@@ -210,8 +234,9 @@ static void logStatusSnapshot(const char* tag) {
     const String ip = wifiOk ? WiFi.localIP().toString() : String("-");
     const int rssi = wifiOk ? WiFi.RSSI() : 0;
 #if ENABLE_ADXL
-    Serial.printf("[STATUS][%s] uptime=%lu ms wifi=%s ip=%s rssi=%d dBm samples=%lu vib=%.2f peak=%.1fHz rpm=%.0f\n",
-                  tag, millis(), wifiStatusName(WiFi.status()), ip.c_str(), rssi, g_samples, g_lastMag, g_fftPeakHzFilt, g_fftPeakRpm);
+    Serial.printf("[STATUS][%s] uptime=%lu ms wifi=%s ip=%s rssi=%d dBm samples=%lu vib=%.2f peak=%.1fHz conf=%.0f%% rpm=%.0f\n",
+                  tag, millis(), wifiStatusName(WiFi.status()), ip.c_str(), rssi, g_samples, g_lastMag, g_fftPeakHzFilt,
+                  g_fftPeakConfidencePct, g_fftPeakRpm);
 #else
     Serial.printf("[STATUS][%s] uptime=%lu ms wifi=%s ip=%s rssi=%d dBm heap=%u\n",
                   tag, millis(), wifiStatusName(WiFi.status()), ip.c_str(), rssi, ESP.getFreeHeap());
@@ -235,24 +260,50 @@ static void handleStatusJson() {
     if (!ensureWebAuth()) return;
 
     const bool wifiOk = (WiFi.status() == WL_CONNECTED);
-    char json[448];
+    char json[512];
 #if ENABLE_ADXL
     snprintf(json, sizeof(json),
              "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,"
              "\"samples\":%lu,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"vibration\":%.3f,"
-             "\"peak_hz\":%.2f,\"peak_amp\":%.3f,\"rpm\":%.1f}",
+             "\"peak_hz\":%.2f,\"peak_amp\":%.3f,\"peak_confidence_pct\":%.1f,\"rpm\":%.1f,\"peak_confidence_threshold_pct\":%u}",
              millis(), wifiOk ? "true" : "false",
              wifiOk ? WiFi.localIP().toString().c_str() : "-",
              wifiOk ? WiFi.RSSI() : 0,
-             g_samples, g_lastX, g_lastY, g_lastZ, g_lastMag, g_fftPeakHzFilt, g_fftPeakAmp, g_fftPeakRpm);
+             g_samples, g_lastX, g_lastY, g_lastZ, g_lastMag, g_fftPeakHzFilt, g_fftPeakAmp, g_fftPeakConfidencePct,
+             g_fftPeakRpm, g_peakConfThreshPct);
 #else
     snprintf(json, sizeof(json),
-             "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,\"heap\":%u}",
+             "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,\"heap\":%u,\"peak_confidence_threshold_pct\":%u}",
              millis(), wifiOk ? "true" : "false",
              wifiOk ? WiFi.localIP().toString().c_str() : "-",
              wifiOk ? WiFi.RSSI() : 0,
-             ESP.getFreeHeap());
+             ESP.getFreeHeap(),
+             g_peakConfThreshPct);
 #endif
+    server.send(200, "application/json", json);
+}
+
+static void handleConfigJson() {
+    if (!ensureWebAuth()) return;
+
+    if (server.hasArg("peak_confidence_threshold_pct")) {
+        int v = server.arg("peak_confidence_threshold_pct").toInt();
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        g_peakConfThreshPct = (uint8_t)v;
+        Serial.printf("[CFG] peak_confidence_threshold_pct=%u\n", g_peakConfThreshPct);
+    } else if (server.hasArg("read_error_threshold_pct")) {
+        int v = server.arg("read_error_threshold_pct").toInt();
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        g_peakConfThreshPct = (uint8_t)v;
+        Serial.printf("[CFG] peak_confidence_threshold_pct=%u\n", g_peakConfThreshPct);
+    }
+
+    char json[96];
+    snprintf(json, sizeof(json),
+             "{\"peak_confidence_threshold_pct\":%u}",
+             g_peakConfThreshPct);
     server.send(200, "application/json", json);
 }
 
@@ -272,6 +323,8 @@ static void handleFftJson() {
     resp += g_fftPeakHzFilt;
     resp += F(",\"peak_amp\":");
     resp += g_fftPeakAmp;
+    resp += F(",\"peak_confidence_pct\":");
+    resp += g_fftPeakConfidencePct;
     resp += F(",\"rpm\":");
     resp += g_fftPeakRpm;
     resp += F(",\"rpm_order\":");
@@ -332,6 +385,10 @@ static void handleRoot() {
         .value { font-size: 1.06rem; font-weight: 650; margin-top: 4px; }
         .mono { font-family: Consolas, "Courier New", monospace; }
         #fftCanvas { width: 100%; height: 180px; background: #f8fafc; border-radius: 8px; display: block; }
+        .cfg-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+        .cfg-row input[type="number"] { width: 84px; padding: 4px 6px; }
+        .cfg-row button { padding: 5px 10px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; }
+        .muted { color: #64748b; font-size: 0.83rem; }
     </style>
 </head>
 <body>
@@ -354,6 +411,12 @@ static void handleRoot() {
                 <div><div class="label">Vibration [m/s2]</div><div class="value mono" id="v">-</div></div>
             </div>
             <p class="label">Probek: <span class="mono" id="samples">-</span> | Peak FFT: <span class="mono" id="peak">-</span> | RPM: <span class="mono" id="rpm">-</span></p>
+            <div class="cfg-row">
+                <span class="label">Prog pewnosci bledu odczytu [%]</span>
+                <input id="errThr" type="number" min="0" max="100" step="1" value="60" />
+                <button id="saveErrThr" type="button">Zapisz</button>
+                <span class="muted">Pewność: <span class="mono" id="errConf">0</span>%</span>
+            </div>
         </div>
 
         <div class="card">
@@ -367,6 +430,22 @@ static void handleRoot() {
         const $ = id => document.getElementById(id);
         const fc = $('fftCanvas');
         const fctx = fc.getContext('2d');
+        let peakConfidenceThresholdPct = 60;
+        let peakConfidencePct = 0;
+
+        async function saveErrorThreshold() {
+            const raw = Number($('errThr').value);
+            const val = Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.round(raw))) : peakConfidenceThresholdPct;
+            $('errThr').value = String(val);
+            try {
+                const r = await fetch('/api/config?peak_confidence_threshold_pct=' + val, { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const d = await r.json();
+                peakConfidenceThresholdPct = Number(d.peak_confidence_threshold_pct || val);
+                $('errThr').value = String(peakConfidenceThresholdPct);
+            } catch (_) {
+            }
+        }
 
         async function refreshStatus() {
             try {
@@ -383,8 +462,20 @@ static void handleRoot() {
                 $('v').textContent = s.vibration.toFixed(3);
                 $('samples').textContent = s.samples;
                 $('peak').textContent = (s.peak_hz || 0).toFixed(1) + ' Hz';
-                $('rpm').textContent = (s.rpm || 0).toFixed(0);
+                peakConfidencePct = Number(s.peak_confidence_pct || 0);
+                if (typeof s.peak_confidence_threshold_pct === 'number') {
+                    peakConfidenceThresholdPct = Math.max(0, Math.min(100, Math.round(s.peak_confidence_threshold_pct)));
+                    $('errThr').value = String(peakConfidenceThresholdPct);
+                }
+                if (peakConfidencePct >= peakConfidenceThresholdPct) {
+                    $('rpm').textContent = (s.rpm || 0).toFixed(0);
+                } else {
+                    $('rpm').textContent = '0';
+                }
+                $('errConf').textContent = peakConfidencePct.toFixed(0);
             } catch (_) {
+                $('errConf').textContent = '0';
+                $('rpm').textContent = '0';
                 $('wifi').textContent = 'Blad odczytu';
             }
         }
@@ -466,6 +557,7 @@ static void handleRoot() {
 
         refreshStatus();
         refreshFFT();
+        $('saveErrThr').addEventListener('click', saveErrorThreshold);
         setInterval(refreshStatus, 1000);
         setInterval(refreshFFT, 600);
     </script>
@@ -566,6 +658,7 @@ void setup() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/api/status", HTTP_GET, handleStatusJson);
     server.on("/api/fft", HTTP_GET, handleFftJson);
+    server.on("/api/config", HTTP_GET, handleConfigJson);
     server.begin();
 
     Serial.println("[HTTP] Server started on port 80");
@@ -651,11 +744,11 @@ void loop() {
         display.clearBuffer();
         display.setFont(u8g2_font_6x10_tf);
 #if ENABLE_ADXL
-        display.drawStr(0, 10, "Wibracje [m/s2]");
-        snprintf(buf, sizeof(buf), "X: %+6.2f", g_lastX); display.drawStr(0, 24, buf);
-        snprintf(buf, sizeof(buf), "Y: %+6.2f", g_lastY); display.drawStr(0, 36, buf);
-        snprintf(buf, sizeof(buf), "Z: %+6.2f", g_lastZ); display.drawStr(0, 48, buf);
-        snprintf(buf, sizeof(buf), "P: %6.1fHz", g_fftPeakHz); display.drawStr(0, 62, buf);
+    snprintf(buf, sizeof(buf), "X: %+6.2f", g_lastX); display.drawStr(0, 12, buf);
+    snprintf(buf, sizeof(buf), "Y: %+6.2f", g_lastY); display.drawStr(0, 24, buf);
+    snprintf(buf, sizeof(buf), "Z: %+6.2f", g_lastZ); display.drawStr(0, 36, buf);
+    snprintf(buf, sizeof(buf), "RPM: %6.0f", g_fftPeakRpm); display.drawStr(0, 48, buf);
+    snprintf(buf, sizeof(buf), "CONF:%5.0f%%", g_fftPeakConfidencePct); display.drawStr(0, 62, buf);
 #else
         snprintf(buf, sizeof(buf), "heap: %u B", ESP.getFreeHeap());
         display.drawStr(0, 12, "ESP32-C3");
