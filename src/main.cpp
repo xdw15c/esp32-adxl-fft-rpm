@@ -98,6 +98,9 @@
 #ifndef CONFIG_HARM_MAX_ORDER
 #define CONFIG_HARM_MAX_ORDER 4
 #endif
+#ifndef CONFIG_HARM_WINDOW_BINS
+#define CONFIG_HARM_WINDOW_BINS 2
+#endif
 
 WebServer server(80);
 #if ENABLE_MODBUS
@@ -116,6 +119,10 @@ static uint16_t g_fftBandMaxHz = (uint16_t)CONFIG_FFT_PEAK_MAX_HZ;
 static uint16_t g_rpmOrder = (uint16_t)CONFIG_RPM_ORDER;
 static uint16_t g_alarmFlags = 0;
 static bool g_sensorPresent = ENABLE_ADXL != 0;
+static float g_cpuLoadPct = 0.0f;
+static uint32_t g_cpuProcAccUs = 0;
+static uint32_t g_cpuBudgetAccUs = 0;
+static uint32_t g_cpuWindowStartUs = 0;
 
 #if ENABLE_OLED
 static unsigned long g_lastOledMs = 0;
@@ -131,7 +138,8 @@ static unsigned long g_samples = 0;
 static unsigned long g_lastSensorLogMs = 0;
 
 static uint32_t g_lastSampleUs = 0;
-static const uint32_t g_samplePeriodUs = 1000000UL / CONFIG_FFT_FS;
+static uint32_t g_samplePeriodUs = 1000000UL / CONFIG_FFT_FS;
+static uint16_t g_actualFs = CONFIG_FFT_FS;
 
 static float g_fftReal[CONFIG_FFT_SIZE];
 static float g_fftImag[CONFIG_FFT_SIZE];
@@ -156,6 +164,7 @@ static float g_harmonicAmp[3] = {0.0f, 0.0f, 0.0f};  // index 0=2x, 1=3x, 2=4x o
 static uint8_t g_harmonicAlarmFlags = 0;               // bits: 0=2x active, 1=3x active, 2=4x active, 3=multiple
 static uint8_t g_harmRatioThreshPct = CONFIG_HARM_RATIO_THRESH_PCT;
 static uint8_t g_harmMaxOrder = CONFIG_HARM_MAX_ORDER;
+static uint8_t g_harmWindowBins = CONFIG_HARM_WINDOW_BINS;
 
 static ArduinoFFT<float> g_fft(g_fftReal, g_fftImag, CONFIG_FFT_SIZE, (float)CONFIG_FFT_FS);
 
@@ -182,23 +191,48 @@ static int16_t clampToI16(long value) {
     return (int16_t)value;
 }
 
+// Maps an ODR value [Hz] to ADXL345 enum and applies it at runtime.
+// Also resets HPF state and clears FFT buffers to avoid transient artefacts.
+static void applyOdr(uint16_t hz) {
+    dataRate_t dr;
+    uint16_t actualHz;
+    if      (hz >= 800) { dr = ADXL345_DATARATE_800_HZ; actualHz = 800; }
+    else if (hz >= 400) { dr = ADXL345_DATARATE_400_HZ; actualHz = 400; }
+    else if (hz >= 200) { dr = ADXL345_DATARATE_200_HZ; actualHz = 200; }
+    else if (hz >= 100) { dr = ADXL345_DATARATE_100_HZ; actualHz = 100; }
+    else                { dr = ADXL345_DATARATE_50_HZ;  actualHz = 50;  }
+    if (actualHz == g_actualFs) return;
+    accel.setDataRate(dr);
+    g_actualFs = actualHz;
+    g_samplePeriodUs = 1000000UL / actualHz;
+    // Reset filters and FFT state to avoid transients.
+    g_hpfPrevIn  = 0.0f;
+    g_hpfPrevOut = 0.0f;
+    g_fftIdx     = 0;
+    memset(g_fftReal, 0, sizeof(g_fftReal));
+    memset(g_fftImag, 0, sizeof(g_fftImag));
+    memset(g_fftMag,  0, sizeof(g_fftMag));
+    Serial.printf("[CFG] ODR=%u Hz\n", actualHz);
+}
+
 // Searches g_fftMag[] for energy at 2x, 3x, 4x of fundHz relative to the fundamental peak.
 // Sets g_harmonicAmp[0..2] and g_harmonicAlarmFlags bits.
 static void computeHarmonics(float fundHz) {
-    const float binHz = (float)CONFIG_FFT_FS / (float)CONFIG_FFT_SIZE;
+    const float binHz = (float)g_actualFs / (float)CONFIG_FFT_SIZE;
     const uint16_t halfN = CONFIG_FFT_SIZE / 2;
+    const uint16_t halfWin = g_harmWindowBins;
     g_harmonicAlarmFlags = 0;
     uint8_t harmCount = 0;
     for (uint8_t k = 2; k <= g_harmMaxOrder && k <= 4; k++) {
         const uint8_t idx = k - 2;  // 2x->0, 3x->1, 4x->2
         const float targetHz = (float)k * fundHz;
-        if (targetHz >= (float)(CONFIG_FFT_FS / 2)) {
+        if (targetHz >= (float)(g_actualFs / 2)) {
             g_harmonicAmp[idx] = 0.0f;
             continue;
         }
         const uint16_t centerBin = (uint16_t)(targetHz / binHz);
-        const uint16_t lo = (centerBin > 2) ? (centerBin - 2) : 1;
-        const uint16_t hi = min((uint16_t)(centerBin + 2), (uint16_t)(halfN - 1));
+        const uint16_t lo = (centerBin > halfWin) ? (centerBin - halfWin) : 1;
+        const uint16_t hi = min((uint16_t)(centerBin + halfWin), (uint16_t)(halfN - 1));
         float maxAmp = 0.0f;
         for (uint16_t i = lo; i <= hi; i++) {
             if (g_fftMag[i] > maxAmp) maxAmp = g_fftMag[i];
@@ -247,7 +281,7 @@ static void computeFFT() {
     g_fft.compute(FFTDirection::Forward);
     g_fft.complexToMagnitude();
 
-    const float binHz = (float)CONFIG_FFT_FS / (float)CONFIG_FFT_SIZE;
+    const float binHz = (float)g_actualFs / (float)CONFIG_FFT_SIZE;
     const uint16_t halfN = CONFIG_FFT_SIZE / 2;
     uint16_t minBin = (uint16_t)((float)g_fftBandMinHz / binHz);
     uint16_t maxBin = (uint16_t)((float)g_fftBandMaxHz / binHz);
@@ -380,7 +414,7 @@ static uint16_t modbusReadInputRegister(uint16_t addr, bool& ok) {
         case 11: return 0;
         case 12: return clampToU16(lroundf(g_fftPeakHzFilt));
         case 13: return clampToU16(lroundf(g_fftPeakAmp * 10.0f));
-        case 14: return CONFIG_FFT_FS;
+        case 14: return g_actualFs;
         case 15: return g_sensorPresent ? 0 : 1;
         case 16: return clampToU16(lroundf(g_harmonicAmp[0] * 100.0f));  // 2x amp x100
         case 17: return clampToU16(lroundf(g_harmonicAmp[1] * 100.0f));  // 3x amp x100
@@ -592,20 +626,21 @@ static void handleStatusJson() {
     snprintf(json, sizeof(json),
              "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,"
              "\"samples\":%lu,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"vibration\":%.3f,"
-             "\"peak_hz\":%.2f,\"peak_amp\":%.3f,\"peak_confidence_pct\":%.1f,\"rpm\":%.1f,\"peak_confidence_threshold_pct\":%u}",
+             "\"peak_hz\":%.2f,\"peak_amp\":%.3f,\"peak_confidence_pct\":%.1f,\"rpm\":%.1f,\"peak_confidence_threshold_pct\":%u,\"cpu_load_pct\":%.1f}",
              millis(), wifiOk ? "true" : "false",
              wifiOk ? WiFi.localIP().toString().c_str() : "-",
              wifiOk ? WiFi.RSSI() : 0,
              g_samples, g_lastX, g_lastY, g_lastZ, g_lastMag, g_fftPeakHzFilt, g_fftPeakAmp, g_fftPeakConfidencePct,
-             g_fftPeakRpm, g_peakConfThreshPct);
+             g_fftPeakRpm, g_peakConfThreshPct, g_cpuLoadPct);
 #else
     snprintf(json, sizeof(json),
-             "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,\"heap\":%u,\"peak_confidence_threshold_pct\":%u}",
+             "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,\"heap\":%u,\"peak_confidence_threshold_pct\":%u,\"cpu_load_pct\":%.1f}",
              millis(), wifiOk ? "true" : "false",
              wifiOk ? WiFi.localIP().toString().c_str() : "-",
              wifiOk ? WiFi.RSSI() : 0,
              ESP.getFreeHeap(),
-             g_peakConfThreshPct);
+             g_peakConfThreshPct,
+             g_cpuLoadPct);
 #endif
     server.send(200, "application/json", json);
 }
@@ -631,12 +666,24 @@ static void handleConfigJson() {
         if (v > 100) v = 100;
         g_harmRatioThreshPct = (uint8_t)v;
         Serial.printf("[CFG] harm_ratio_thresh_pct=%u\n", g_harmRatioThreshPct);
+    } else if (server.hasArg("harm_window_bins")) {
+        int v = server.arg("harm_window_bins").toInt();
+        if (v < 0) v = 0;
+        if (v > 32) v = 32;
+        g_harmWindowBins = (uint8_t)v;
+        Serial.printf("[CFG] harm_window_bins=%u\n", g_harmWindowBins);
+    } else if (server.hasArg("odr_hz")) {
+#if ENABLE_ADXL
+        applyOdr((uint16_t)max(0, (int)server.arg("odr_hz").toInt()));
+#endif
     }
 
-    char json[128];
+    char json[224];
+    const float binHz = (float)g_actualFs / (float)CONFIG_FFT_SIZE;
+    const float harmToleranceHz = g_harmWindowBins * binHz;
     snprintf(json, sizeof(json),
-             "{\"peak_confidence_threshold_pct\":%u,\"harm_ratio_thresh_pct\":%u,\"harm_max_order\":%u}",
-             g_peakConfThreshPct, g_harmRatioThreshPct, g_harmMaxOrder);
+             "{\"peak_confidence_threshold_pct\":%u,\"harm_ratio_thresh_pct\":%u,\"harm_max_order\":%u,\"harm_window_bins\":%u,\"harm_tolerance_hz\":%.3f,\"odr_hz\":%u}",
+             g_peakConfThreshPct, g_harmRatioThreshPct, g_harmMaxOrder, g_harmWindowBins, harmToleranceHz, g_actualFs);
     server.send(200, "application/json", json);
 }
 
@@ -646,13 +693,15 @@ static void handleFftJson() {
     String resp;
     resp.reserve(1400);
     resp += F("{\"fs\":");
-    resp += CONFIG_FFT_FS;
+    resp += g_actualFs;
     resp += F(",\"n\":");
     resp += (CONFIG_FFT_SIZE / 2);
     resp += F(",\"resolution\":");
-    resp += ((float)CONFIG_FFT_FS / CONFIG_FFT_SIZE);
+    resp += ((float)g_actualFs / CONFIG_FFT_SIZE);
 #if ENABLE_ADXL
     resp += F(",\"peak_hz\":");
+    resp += g_fftPeakHz;
+    resp += F(",\"peak_hz_filt\":");
     resp += g_fftPeakHzFilt;
     resp += F(",\"peak_amp\":");
     resp += g_fftPeakAmp;
@@ -666,6 +715,20 @@ static void handleFftJson() {
     resp += g_fftBandMinHz;
     resp += F(",\"band_max_hz\":");
     resp += g_fftBandMaxHz;
+    resp += F(",\"harmonic_amps\":[");
+    resp += g_harmonicAmp[0]; resp += ',';
+    resp += g_harmonicAmp[1]; resp += ',';
+    resp += g_harmonicAmp[2];
+    resp += F("],\"harmonic_alarm_flags\":");
+    resp += g_harmonicAlarmFlags;
+    resp += F(",\"harm_ratio_thresh_pct\":");
+    resp += g_harmRatioThreshPct;
+    resp += F(",\"harm_window_bins\":");
+    resp += g_harmWindowBins;
+    resp += F(",\"harm_tolerance_hz\":");
+    resp += (g_harmWindowBins * ((float)g_actualFs / CONFIG_FFT_SIZE));
+    resp += F(",\"harm_max_order\":");
+    resp += g_harmMaxOrder;
     resp += F(",\"mag\":[");
     for (uint16_t i = 0; i < CONFIG_FFT_SIZE / 2; i++) {
         if (i) resp += ',';
@@ -722,17 +785,80 @@ static void handleRoot() {
         .cfg-row input[type="number"] { width: 84px; padding: 4px 6px; }
         .cfg-row button { padding: 5px 10px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; }
         .muted { color: #64748b; font-size: 0.83rem; }
+        .help-target { cursor: help; }
+        .help-btn {
+            border: 0;
+            border-radius: 999px;
+            width: 22px;
+            height: 22px;
+            font-size: 12px;
+            font-weight: 700;
+            line-height: 22px;
+            color: #1e3a8a;
+            background: #dbeafe;
+            cursor: pointer;
+        }
+        .mini-help {
+            position: fixed;
+            z-index: 40;
+            max-width: 290px;
+            background: #0f172a;
+            color: #f8fafc;
+            border-radius: 10px;
+            padding: 10px 12px;
+            font-size: 12px;
+            line-height: 1.35;
+            box-shadow: 0 12px 26px rgba(2, 6, 23, 0.24);
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(4px);
+            transition: opacity .18s ease, transform .18s ease;
+        }
+        .mini-help.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.48);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 45;
+            padding: 16px;
+        }
+        .modal-backdrop.show { display: flex; }
+        .modal-card {
+            width: min(760px, 100%);
+            max-height: 86vh;
+            overflow: auto;
+            background: #fff;
+            border-radius: 14px;
+            padding: 16px;
+            box-shadow: 0 20px 44px rgba(2, 6, 23, .28);
+        }
+        .modal-card h2 { margin: 0 0 8px; font-size: 1.1rem; }
+        .modal-card h3 { margin: 14px 0 4px; font-size: .98rem; color: #1e3a8a; }
+        .modal-card p { margin: 0; color: #334155; font-size: .92rem; }
+        .modal-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
     </style>
 </head>
 <body>
+    <div id="miniHelp" class="mini-help" role="status" aria-live="polite"></div>
+
     <div class="wrap">
         <div class="card">
-            <h1>ESP32-C3 ADXL345</h1>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                <h1 style="margin:0">ESP32-C3 ADXL345</h1>
+                <button id="openParamGuide" class="help-btn" type="button" title="Wiekszy opis parametrow zmienianych przez WWW">i</button>
+            </div>
             <div class="grid">
                 <div><div class="label">Wi-Fi</div><div class="value" id="wifi">-</div></div>
                 <div><div class="label">IP</div><div class="value mono" id="ip">-</div></div>
                 <div><div class="label">RSSI</div><div class="value" id="rssi">-</div></div>
                 <div><div class="label">Uptime [ms]</div><div class="value mono" id="uptime">-</div></div>
+                <div><div class="label">CPU [%]</div><div class="value mono" id="cpu">-</div></div>
             </div>
         </div>
 
@@ -756,6 +882,24 @@ static void handleRoot() {
                 <button id="saveHarmThr" type="button">Zapisz</button>
                 <span class="muted">Harmoniczne: <span class="mono" id="harmStatus">-</span></span>
             </div>
+            <div class="cfg-row">
+                <span class="label">Szerokosc okna harmonicznych [biny]</span>
+                <input id="harmBins" type="number" min="0" max="32" step="1" value="2" />
+                <button id="saveHarmBins" type="button">Zapisz</button>
+                <span class="muted">Tolerancja: +/- <span class="mono" id="harmTol">-</span> Hz (okno <span class="mono" id="harmWinHz">-</span> Hz)</span>
+            </div>
+            <div class="cfg-row">
+                <span class="label">ODR czujnika [Hz]</span>
+                <select id="odrSelect">
+                    <option value="50">50 Hz</option>
+                    <option value="100">100 Hz</option>
+                    <option value="200">200 Hz</option>
+                    <option value="400">400 Hz</option>
+                    <option value="800" selected>800 Hz</option>
+                </select>
+                <button id="saveOdr" type="button">Ustaw</button>
+                <span class="muted">Rozdzielczosc: <span class="mono" id="fftRes2">-</span> Hz/bin</span>
+            </div>
         </div>
 
         <div class="card">
@@ -765,13 +909,96 @@ static void handleRoot() {
         </div>
     </div>
 
+    <div id="paramGuideModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="paramGuideTitle">
+        <div class="modal-card">
+            <h2 id="paramGuideTitle">Parametry zmieniane przez WWW</h2>
+            <h3>Prog pewnosci bledu odczytu [%]</h3>
+            <p>Minimalna pewnosc piku FFT potrzebna do uznania RPM za wiarygodne. Gdy pewnosc spadnie ponizej progu, RPM jest zerowane i alarmy zalezne od piku sa mniej istotne.</p>
+            <h3>Prog amplitudy harmonicznej [%]</h3>
+            <p>Minimalny stosunek amplitudy harmonicznej do amplitudy fundamentalnej, przy ktorym harmoniczna jest oznaczana jako aktywna. Nizszy prog = wiecej czuly, wyzszy prog = mniej falszywych alarmow.</p>
+            <h3>Szerokosc okna harmonicznych [biny]</h3>
+            <p>Polowa okna wyszukiwania maksimum harmonicznej wokol czestotliwosci docelowej. Dla wartosci 2 szukamy od -2 do +2 binow. Tolerancja w Hz zalezy od Fs oraz N i jest liczona na biezaco.</p>
+            <h3>ODR czujnika [Hz]</h3>
+            <p>Czestotliwosc probkowania ADXL345 i jednoczesnie Fs analizy FFT. Wieksze ODR daje szersze pasmo, mniejsze ODR poprawia rozdzielczosc czestotliwosci dla stalego N=256.</p>
+            <div class="modal-actions">
+                <button id="closeParamGuide" type="button">Zamknij</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const $ = id => document.getElementById(id);
         const fc = $('fftCanvas');
         const fctx = fc.getContext('2d');
+        const miniHelp = $('miniHelp');
+        const paramGuideModal = $('paramGuideModal');
         let peakConfidenceThresholdPct = 60;
         let peakConfidencePct = 0;
         let harmRatioThreshPct = 30;
+        let harmWindowBins = 2;
+
+        const miniHelpTexts = {
+            wifi: 'Stan polaczenia ESP32 z siecia Wi-Fi.',
+            ip: 'Adres IP urzadzenia w sieci lokalnej.',
+            rssi: 'Sila sygnalu Wi-Fi w dBm. Blizej 0 oznacza mocniejszy sygnal.',
+            uptime: 'Czas pracy od ostatniego restartu [ms].',
+            cpu: 'Przyblizone obciazenie toru pomiar+FFT wzgledem budzetu czasowego probkowania [%].',
+            x: 'Przyspieszenie osi X [m/s2].',
+            y: 'Przyspieszenie osi Y [m/s2].',
+            z: 'Przyspieszenie osi Z [m/s2].',
+            v: 'Modul wektora drgan: sqrt(x^2 + y^2 + z^2).',
+            samples: 'Liczba pobranych probek od startu.',
+            peak: 'Dominujaca czestotliwosc piku FFT po filtracji [Hz].',
+            rpm: 'Obroty/min liczone z piku FFT i rzedu RPM.',
+            errThr: 'Konfigurowalny prog pewnosci piku FFT [%].',
+            errConf: 'Biezaca pewnosc piku FFT [%].',
+            harmThr: 'Konfigurowalny prog aktywacji harmonicznej [% amplitudy fundamentalnej].',
+            harmStatus: 'Ktore harmoniczne (2x/3x/4x) przekroczyly prog.',
+            harmBins: 'Konfigurowana polowa okna wyszukiwania harmonicznych w binach FFT.',
+            harmTol: 'Przeliczona tolerancja jednostronna: bins * Fs / N [Hz].',
+            harmWinHz: 'Pelne okno analizy harmonicznej: 2 * tolerancja [Hz].',
+            odrSelect: 'Konfigurowana czestotliwosc probkowania ADXL345 [Hz].',
+            fftRes2: 'Rozdzielczosc FFT wynikajaca z bieżącego Fs i N [Hz/bin].',
+            fftFs: 'Aktualne Fs analizy FFT [Hz].',
+            fftRes: 'Aktualna rozdzielczosc FFT [Hz/bin].',
+            fftN: 'Liczba punktow polowy widma (N/2).',
+            fftBand: 'Pasmo przeszukiwania piku FFT [Hz].',
+            openParamGuide: 'Otwiera pelny opis parametrow konfigurowanych przez WWW.'
+        };
+
+        function showMiniHelp(target) {
+            if (!target || !target.id) return;
+            const text = miniHelpTexts[target.id];
+            if (!text) return;
+            miniHelp.textContent = text;
+            const r = target.getBoundingClientRect();
+            const left = Math.min(window.innerWidth - 308, Math.max(8, r.left));
+            const top = Math.min(window.innerHeight - 84, r.bottom + 8);
+            miniHelp.style.left = left + 'px';
+            miniHelp.style.top = top + 'px';
+            miniHelp.classList.add('show');
+            clearTimeout(showMiniHelp._t);
+            showMiniHelp._t = setTimeout(() => miniHelp.classList.remove('show'), 2600);
+        }
+
+        function initMiniHelpTargets() {
+            Object.keys(miniHelpTexts).forEach(id => {
+                const el = $(id);
+                if (!el) return;
+                el.classList.add('help-target');
+                el.addEventListener('click', () => showMiniHelp(el));
+            });
+        }
+
+        function openParamGuide() { paramGuideModal.classList.add('show'); }
+        function closeParamGuide() { paramGuideModal.classList.remove('show'); }
+
+        function setValueIfNotFocused(id, valueStr) {
+            const el = $(id);
+            if (!el) return;
+            if (document.activeElement === el) return;
+            el.value = valueStr;
+        }
 
         async function saveErrorThreshold() {
             const raw = Number($('errThr').value);
@@ -782,7 +1009,7 @@ static void handleRoot() {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 const d = await r.json();
                 peakConfidenceThresholdPct = Number(d.peak_confidence_threshold_pct || val);
-                $('errThr').value = String(peakConfidenceThresholdPct);
+                setValueIfNotFocused('errThr', String(peakConfidenceThresholdPct));
             } catch (_) {
             }
         }
@@ -796,7 +1023,41 @@ static void handleRoot() {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 const d = await r.json();
                 harmRatioThreshPct = Number(d.harm_ratio_thresh_pct || val);
-                $('harmThr').value = String(harmRatioThreshPct);
+                setValueIfNotFocused('harmThr', String(harmRatioThreshPct));
+            } catch (_) {
+            }
+        }
+
+        async function saveHarmWindowBins() {
+            const raw = Number($('harmBins').value);
+            const val = Number.isFinite(raw) ? Math.max(0, Math.min(32, Math.round(raw))) : harmWindowBins;
+            $('harmBins').value = String(val);
+            try {
+                const r = await fetch('/api/config?harm_window_bins=' + val, { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const d = await r.json();
+                if (typeof d.harm_window_bins === 'number') {
+                    harmWindowBins = Math.max(0, Math.min(32, Math.round(d.harm_window_bins)));
+                    setValueIfNotFocused('harmBins', String(harmWindowBins));
+                }
+                if (typeof d.harm_tolerance_hz === 'number') {
+                    $('harmTol').textContent = d.harm_tolerance_hz.toFixed(2);
+                    $('harmWinHz').textContent = (2 * d.harm_tolerance_hz).toFixed(2);
+                }
+            } catch (_) {
+            }
+        }
+
+        async function saveOdr() {
+            const val = Number($('odrSelect').value);
+            try {
+                const r = await fetch('/api/config?odr_hz=' + val, { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const d = await r.json();
+                if (d.odr_hz) {
+                    setValueIfNotFocused('odrSelect', String(d.odr_hz));
+                    $('fftRes2').textContent = (d.odr_hz / 256).toFixed(2);
+                }
             } catch (_) {
             }
         }
@@ -810,6 +1071,7 @@ static void handleRoot() {
                 $('ip').textContent = s.ip;
                 $('rssi').textContent = s.rssi + ' dBm';
                 $('uptime').textContent = s.uptime_ms;
+                $('cpu').textContent = (typeof s.cpu_load_pct === 'number') ? s.cpu_load_pct.toFixed(1) : '-';
                 $('x').textContent = s.x.toFixed(3);
                 $('y').textContent = s.y.toFixed(3);
                 $('z').textContent = s.z.toFixed(3);
@@ -819,7 +1081,7 @@ static void handleRoot() {
                 peakConfidencePct = Number(s.peak_confidence_pct || 0);
                 if (typeof s.peak_confidence_threshold_pct === 'number') {
                     peakConfidenceThresholdPct = Math.max(0, Math.min(100, Math.round(s.peak_confidence_threshold_pct)));
-                    $('errThr').value = String(peakConfidenceThresholdPct);
+                    setValueIfNotFocused('errThr', String(peakConfidenceThresholdPct));
                 }
                 if (peakConfidencePct >= peakConfidenceThresholdPct) {
                     $('rpm').textContent = (s.rpm || 0).toFixed(0);
@@ -830,6 +1092,7 @@ static void handleRoot() {
             } catch (_) {
                 $('errConf').textContent = '0';
                 $('rpm').textContent = '0';
+                $('cpu').textContent = '-';
                 $('wifi').textContent = 'Blad odczytu';
             }
         }
@@ -844,6 +1107,11 @@ static void handleRoot() {
                 $('fftRes').textContent = d.resolution.toFixed(2);
                 $('fftN').textContent = d.n;
                 $('fftBand').textContent = d.band_min_hz.toFixed(1) + '-' + d.band_max_hz.toFixed(1) + ' Hz';
+                // Sync ODR dropdown and resolution hint
+                if (d.fs && $('odrSelect').value !== String(d.fs)) {
+                    setValueIfNotFocused('odrSelect', String(d.fs));
+                }
+                $('fftRes2').textContent = d.resolution.toFixed(2);
 
                 const dpr = window.devicePixelRatio || 1;
                 const W = fc.clientWidth;
@@ -911,7 +1179,15 @@ static void handleRoot() {
                 const harmAlarm = d.harmonic_alarm_flags || 0;
                 if (typeof d.harm_ratio_thresh_pct === 'number') {
                     harmRatioThreshPct = d.harm_ratio_thresh_pct;
-                    $('harmThr').value = String(harmRatioThreshPct);
+                    setValueIfNotFocused('harmThr', String(harmRatioThreshPct));
+                }
+                if (typeof d.harm_window_bins === 'number') {
+                    harmWindowBins = Math.max(0, Math.min(32, Math.round(d.harm_window_bins)));
+                    setValueIfNotFocused('harmBins', String(harmWindowBins));
+                }
+                if (typeof d.harm_tolerance_hz === 'number') {
+                    $('harmTol').textContent = d.harm_tolerance_hz.toFixed(2);
+                    $('harmWinHz').textContent = (2 * d.harm_tolerance_hz).toFixed(2);
                 }
                 const harmLabels = ['2x', '3x', '4x'];
                 const harmStatus = [];
@@ -942,8 +1218,19 @@ static void handleRoot() {
 
         refreshStatus();
         refreshFFT();
+        initMiniHelpTargets();
         $('saveErrThr').addEventListener('click', saveErrorThreshold);
         $('saveHarmThr').addEventListener('click', saveHarmThreshold);
+        $('saveHarmBins').addEventListener('click', saveHarmWindowBins);
+        $('saveOdr').addEventListener('click', saveOdr);
+        $('openParamGuide').addEventListener('click', openParamGuide);
+        $('closeParamGuide').addEventListener('click', closeParamGuide);
+        paramGuideModal.addEventListener('click', e => {
+            if (e.target === paramGuideModal) closeParamGuide();
+        });
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') closeParamGuide();
+        });
         setInterval(refreshStatus, 1000);
         setInterval(refreshFFT, 600);
     </script>
@@ -1039,7 +1326,7 @@ void setup() {
                   CONFIG_ADXL_SPI_SCK_PIN,
                   CONFIG_ADXL_SPI_MOSI_PIN,
                   CONFIG_ADXL_SPI_MISO_PIN,
-                  CONFIG_FFT_FS);
+                  g_actualFs);
 #endif
 
     connectWiFi();
@@ -1072,6 +1359,11 @@ void setup() {
 }
 
 void loop() {
+    const uint32_t nowCpuUs = micros();
+    if (g_cpuWindowStartUs == 0) {
+        g_cpuWindowStartUs = nowCpuUs;
+    }
+
     server.handleClient();
 
 #if ENABLE_MODBUS
@@ -1081,6 +1373,7 @@ void loop() {
 #if ENABLE_ADXL
     const uint32_t nowUs = micros();
     if ((uint32_t)(nowUs - g_lastSampleUs) >= g_samplePeriodUs) {
+        const uint32_t procStartUs = micros();
         g_lastSampleUs += g_samplePeriodUs;
 
         sensors_event_t event;
@@ -1096,7 +1389,7 @@ void loop() {
         g_winSampleCount++;
         g_samples++;
 
-        const float dt = 1.0f / (float)CONFIG_FFT_FS;
+        const float dt = 1.0f / (float)g_actualFs;
         const float rc = 1.0f / (2.0f * PI * CONFIG_HPF_CUTOFF_HZ);
         const float hpAlpha = rc / (rc + dt);
         const float hpOut = hpAlpha * (g_hpfPrevOut + g_lastMag - g_hpfPrevIn);
@@ -1120,6 +1413,9 @@ void loop() {
             g_winSampleCount = 0;
             computeFFT();
         }
+        const uint32_t procEndUs = micros();
+        g_cpuProcAccUs += (uint32_t)(procEndUs - procStartUs);
+        g_cpuBudgetAccUs += g_samplePeriodUs;
     }
 #endif
 
@@ -1182,4 +1478,17 @@ void loop() {
 #else
     delay(1);
 #endif
+
+    const uint32_t loopEndUs = micros();
+    const uint32_t elapsedUs = (uint32_t)(loopEndUs - g_cpuWindowStartUs);
+    if (elapsedUs >= 1000000UL) {
+        if (g_cpuBudgetAccUs > 0) {
+            g_cpuLoadPct = constrain((100.0f * (float)g_cpuProcAccUs) / (float)g_cpuBudgetAccUs, 0.0f, 100.0f);
+        } else {
+            g_cpuLoadPct = 0.0f;
+        }
+        g_cpuProcAccUs = 0;
+        g_cpuBudgetAccUs = 0;
+        g_cpuWindowStartUs = loopEndUs;
+    }
 }
