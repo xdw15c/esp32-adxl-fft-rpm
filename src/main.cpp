@@ -101,6 +101,9 @@
 #ifndef CONFIG_HARM_WINDOW_BINS
 #define CONFIG_HARM_WINDOW_BINS 2
 #endif
+#ifndef CONFIG_TREND_WINDOW_SEC_DEFAULT
+#define CONFIG_TREND_WINDOW_SEC_DEFAULT 30
+#endif
 
 WebServer server(80);
 #if ENABLE_MODBUS
@@ -119,6 +122,7 @@ static uint16_t g_fftBandMaxHz = (uint16_t)CONFIG_FFT_PEAK_MAX_HZ;
 static uint16_t g_rpmOrder = (uint16_t)CONFIG_RPM_ORDER;
 static uint16_t g_alarmFlags = 0;
 static bool g_sensorPresent = ENABLE_ADXL != 0;
+static uint8_t g_trendWindowSec = CONFIG_TREND_WINDOW_SEC_DEFAULT;
 static float g_cpuLoadPct = 0.0f;
 static uint32_t g_cpuProcAccUs = 0;
 static uint32_t g_cpuBudgetAccUs = 0;
@@ -140,6 +144,7 @@ static unsigned long g_lastSensorLogMs = 0;
 static uint32_t g_lastSampleUs = 0;
 static uint32_t g_samplePeriodUs = 1000000UL / CONFIG_FFT_FS;
 static uint16_t g_actualFs = CONFIG_FFT_FS;
+static uint16_t g_fftNActive = CONFIG_FFT_SIZE;
 
 static float g_fftReal[CONFIG_FFT_SIZE];
 static float g_fftImag[CONFIG_FFT_SIZE];
@@ -153,6 +158,9 @@ static float g_rmsX = 0.0f;
 static float g_rmsY = 0.0f;
 static float g_rmsZ = 0.0f;
 static float g_rmsTotal = 0.0f;
+static float g_winSumX = 0.0f;
+static float g_winSumY = 0.0f;
+static float g_winSumZ = 0.0f;
 static float g_winSumSqX = 0.0f;
 static float g_winSumSqY = 0.0f;
 static float g_winSumSqZ = 0.0f;
@@ -165,8 +173,7 @@ static uint8_t g_harmonicAlarmFlags = 0;               // bits: 0=2x active, 1=3
 static uint8_t g_harmRatioThreshPct = CONFIG_HARM_RATIO_THRESH_PCT;
 static uint8_t g_harmMaxOrder = CONFIG_HARM_MAX_ORDER;
 static uint8_t g_harmWindowBins = CONFIG_HARM_WINDOW_BINS;
-
-static ArduinoFFT<float> g_fft(g_fftReal, g_fftImag, CONFIG_FFT_SIZE, (float)CONFIG_FFT_FS);
+static float g_prevFundHz = 0.0f;
 
 Adafruit_ADXL345_Unified accel(
     CONFIG_ADXL_SPI_SCK_PIN,
@@ -191,6 +198,61 @@ static int16_t clampToI16(long value) {
     return (int16_t)value;
 }
 
+static bool isValidFftN(uint16_t n) {
+    if (n < 64 || n > CONFIG_FFT_SIZE) return false;
+    return (n & (n - 1)) == 0;
+}
+
+static uint8_t getFftNOptions(uint16_t* out, uint8_t maxOut) {
+    uint8_t c = 0;
+    for (uint16_t n = 64; n <= CONFIG_FFT_SIZE && c < maxOut; n <<= 1) {
+        out[c++] = n;
+    }
+    if (c == 0 && maxOut > 0) {
+        out[c++] = CONFIG_FFT_SIZE;
+    }
+    return c;
+}
+
+static void resetAnalysisState() {
+    g_lastSampleUs = micros();
+    g_fftIdx = 0;
+    g_hpfPrevIn = 0.0f;
+    g_hpfPrevOut = 0.0f;
+    g_winSumSqX = 0.0f;
+    g_winSumSqY = 0.0f;
+    g_winSumSqZ = 0.0f;
+    g_winSumX = 0.0f;
+    g_winSumY = 0.0f;
+    g_winSumZ = 0.0f;
+    g_winSampleCount = 0;
+    g_rmsX = 0.0f;
+    g_rmsY = 0.0f;
+    g_rmsZ = 0.0f;
+    g_rmsTotal = 0.0f;
+    g_fftPeakHz = 0.0f;
+    g_fftPeakHzFilt = 0.0f;
+    g_fftPeakAmp = 0.0f;
+    g_fftPeakRpm = 0.0f;
+    g_fftPeakConfidencePct = 0.0f;
+    g_prevFundHz = 0.0f;
+    g_harmonicAmp[0] = 0.0f;
+    g_harmonicAmp[1] = 0.0f;
+    g_harmonicAmp[2] = 0.0f;
+    g_harmonicAlarmFlags = 0;
+    memset(g_fftReal, 0, sizeof(g_fftReal));
+    memset(g_fftImag, 0, sizeof(g_fftImag));
+    memset(g_fftMag, 0, sizeof(g_fftMag));
+}
+
+static void applyFftN(uint16_t n) {
+    if (!isValidFftN(n)) return;
+    if (n == g_fftNActive) return;
+    g_fftNActive = n;
+    resetAnalysisState();
+    Serial.printf("[CFG] FFT_N=%u\n", g_fftNActive);
+}
+
 // Maps an ODR value [Hz] to ADXL345 enum and applies it at runtime.
 // Also resets HPF state and clears FFT buffers to avoid transient artefacts.
 static void applyOdr(uint16_t hz) {
@@ -205,21 +267,16 @@ static void applyOdr(uint16_t hz) {
     accel.setDataRate(dr);
     g_actualFs = actualHz;
     g_samplePeriodUs = 1000000UL / actualHz;
-    // Reset filters and FFT state to avoid transients.
-    g_hpfPrevIn  = 0.0f;
-    g_hpfPrevOut = 0.0f;
-    g_fftIdx     = 0;
-    memset(g_fftReal, 0, sizeof(g_fftReal));
-    memset(g_fftImag, 0, sizeof(g_fftImag));
-    memset(g_fftMag,  0, sizeof(g_fftMag));
+    // Reset analysis state because previous samples were captured with different timing.
+    resetAnalysisState();
     Serial.printf("[CFG] ODR=%u Hz\n", actualHz);
 }
 
 // Searches g_fftMag[] for energy at 2x, 3x, 4x of fundHz relative to the fundamental peak.
 // Sets g_harmonicAmp[0..2] and g_harmonicAlarmFlags bits.
 static void computeHarmonics(float fundHz) {
-    const float binHz = (float)g_actualFs / (float)CONFIG_FFT_SIZE;
-    const uint16_t halfN = CONFIG_FFT_SIZE / 2;
+    const float binHz = (float)g_actualFs / (float)g_fftNActive;
+    const uint16_t halfN = g_fftNActive / 2;
     const uint16_t halfWin = g_harmWindowBins;
     g_harmonicAlarmFlags = 0;
     uint8_t harmCount = 0;
@@ -266,28 +323,34 @@ static void updateAlarmFlags() {
 }
 
 static void computeFFT() {
+    if (!isValidFftN(g_fftNActive)) {
+        g_fftNActive = CONFIG_FFT_SIZE;
+    }
+    const uint16_t nActive = g_fftNActive;
+
     float mean = 0.0f;
-    for (uint16_t i = 0; i < CONFIG_FFT_SIZE; i++) {
+    for (uint16_t i = 0; i < nActive; i++) {
         mean += g_fftReal[i];
     }
-    mean /= CONFIG_FFT_SIZE;
+    mean /= nActive;
 
-    for (uint16_t i = 0; i < CONFIG_FFT_SIZE; i++) {
+    for (uint16_t i = 0; i < nActive; i++) {
         g_fftReal[i] -= mean;
         g_fftImag[i] = 0.0f;
     }
 
-    g_fft.windowing(FFTWindow::Hamming, FFTDirection::Forward);
-    g_fft.compute(FFTDirection::Forward);
-    g_fft.complexToMagnitude();
+    ArduinoFFT<float> fft(g_fftReal, g_fftImag, nActive, (float)g_actualFs);
+    fft.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+    fft.compute(FFTDirection::Forward);
+    fft.complexToMagnitude();
 
-    const float binHz = (float)g_actualFs / (float)CONFIG_FFT_SIZE;
-    const uint16_t halfN = CONFIG_FFT_SIZE / 2;
+    const float binHz = (float)g_actualFs / (float)nActive;
+    const uint16_t halfN = nActive / 2;
     uint16_t minBin = (uint16_t)((float)g_fftBandMinHz / binHz);
     uint16_t maxBin = (uint16_t)((float)g_fftBandMaxHz / binHz);
     if (minBin < 1) minBin = 1;
     if (maxBin >= (halfN - 1)) maxBin = halfN - 1;
-    const float norm = 2.0f / (float)CONFIG_FFT_SIZE;
+    const float norm = 2.0f / (float)nActive;
     const float magAlpha = 0.22f;
 
     uint16_t peakBin = minBin;
@@ -304,6 +367,114 @@ static void computeFFT() {
             peakBin = i;
         }
     }
+
+    // Step 1: build candidate fundamentals from strongest line and its subharmonics.
+    uint16_t candidates[4] = {peakBin, (uint16_t)(peakBin / 2), (uint16_t)(peakBin / 3), 0};
+
+    auto localPeak = [&](uint16_t center, uint16_t& outBin) -> float {
+        if (center < minBin) center = minBin;
+        if (center > maxBin) center = maxBin;
+        const uint16_t lo = (center > 1) ? (center - 1) : center;
+        const uint16_t hi = min((uint16_t)(center + 1), maxBin);
+        float a = 0.0f;
+        outBin = center;
+        for (uint16_t i = lo; i <= hi; i++) {
+            if (g_fftMag[i] > a) {
+                a = g_fftMag[i];
+                outBin = i;
+            }
+        }
+        return a;
+    };
+
+    auto scoreCandidate = [&](uint16_t center, uint16_t& outBin, float& outA1) -> float {
+        if (center <= minBin || center >= maxBin) {
+            outBin = center;
+            outA1 = 0.0f;
+            return -1e9f;
+        }
+        uint16_t b1 = center;
+        const float a1 = localPeak(center, b1);
+        if (a1 <= 1e-6f) {
+            outBin = b1;
+            outA1 = 0.0f;
+            return -1e9f;
+        }
+
+        float score = a1;
+        if ((uint16_t)(2 * b1) <= maxBin) {
+            uint16_t b2 = (uint16_t)(2 * b1);
+            const float a2 = localPeak(b2, b2);
+            score += 0.65f * a2;
+            if (a2 > 0.18f * a1) score += 0.10f * a1;
+        }
+        if ((uint16_t)(3 * b1) <= maxBin) {
+            uint16_t b3 = (uint16_t)(3 * b1);
+            const float a3 = localPeak(b3, b3);
+            score += 0.45f * a3;
+            if (a3 > 0.12f * a1) score += 0.08f * a1;
+        }
+
+        if (g_prevFundHz > 0.0f) {
+            const float candHz = b1 * binHz;
+            const float rel = fabsf(candHz - g_prevFundHz) / (g_prevFundHz + 1e-6f);
+            if (rel <= 0.20f) score += 0.20f * a1;
+            else if (rel >= 0.70f) score -= 0.20f * a1;
+        }
+
+        outBin = b1;
+        outA1 = a1;
+        return score;
+    };
+
+    // Step 2: choose best fundamental candidate from 1x/2x/3x-consistency score.
+    float bestScore = -1e9f;
+    uint16_t bestBin = peakBin;
+    float bestAmp = peakAmp;
+    for (uint8_t ci = 0; ci < 3; ci++) {
+        const uint16_t cand = candidates[ci];
+        if (cand <= minBin || cand >= maxBin) continue;
+        bool duplicate = false;
+        for (uint8_t cj = 0; cj < ci; cj++) {
+            if (candidates[cj] == cand) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        uint16_t candBin = cand;
+        float candAmp = 0.0f;
+        const float candScore = scoreCandidate(cand, candBin, candAmp);
+        if (candScore > bestScore) {
+            bestScore = candScore;
+            bestBin = candBin;
+            bestAmp = candAmp;
+        }
+    }
+
+    // Step 3: hysteresis against sudden 1x<->2x/3x jumps.
+    if (g_prevFundHz > 0.0f) {
+        uint16_t prevCenter = (uint16_t)lroundf(g_prevFundHz / binHz);
+        if (prevCenter < minBin) prevCenter = minBin;
+        if (prevCenter > maxBin) prevCenter = maxBin;
+        uint16_t prevBin = prevCenter;
+        float prevAmp = 0.0f;
+        const float prevScore = scoreCandidate(prevCenter, prevBin, prevAmp);
+        const float bestHz = bestBin * binHz;
+        const float ratio = bestHz / (g_prevFundHz + 1e-6f);
+        const bool harmonicJump =
+            (ratio > 1.75f && ratio < 2.25f) || (ratio > 0.44f && ratio < 0.57f) ||
+            (ratio > 2.75f && ratio < 3.25f) || (ratio > 0.30f && ratio < 0.38f);
+
+        if (harmonicJump && prevScore > -1e8f && bestScore < prevScore * 1.15f) {
+            bestBin = prevBin;
+            bestAmp = prevAmp;
+            bestScore = prevScore;
+        }
+    }
+
+    peakBin = bestBin;
+    peakAmp = bestAmp;
 
     for (uint16_t i = minBin; i <= maxBin; i++) {
         if (i + 1 < peakBin || i > peakBin + 1) {
@@ -335,9 +506,11 @@ static void computeFFT() {
 
     if (g_fftPeakConfidencePct >= g_peakConfThreshPct) {
         g_fftPeakRpm = (g_fftPeakHzFilt * 60.0f) / max<uint16_t>(1, g_rpmOrder);
+        g_prevFundHz = g_fftPeakHzFilt;
         computeHarmonics(g_fftPeakHzFilt);
     } else {
         g_fftPeakRpm = 0.0f;
+        g_prevFundHz = 0.0f;
         g_harmonicAlarmFlags = 0;
         g_harmonicAmp[0] = 0.0f;
         g_harmonicAmp[1] = 0.0f;
@@ -621,26 +794,37 @@ static void handleStatusJson() {
     if (!ensureWebAuth()) return;
 
     const bool wifiOk = (WiFi.status() == WL_CONNECTED);
-    char json[512];
+    const uint32_t heapFree = ESP.getFreeHeap();
+    const uint32_t heapTotal = ESP.getHeapSize();
+    const uint32_t heapUsed = (heapTotal >= heapFree) ? (heapTotal - heapFree) : 0;
+    char json[640];
 #if ENABLE_ADXL
     snprintf(json, sizeof(json),
              "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,"
              "\"samples\":%lu,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"vibration\":%.3f,"
-             "\"peak_hz\":%.2f,\"peak_amp\":%.3f,\"peak_confidence_pct\":%.1f,\"rpm\":%.1f,\"peak_confidence_threshold_pct\":%u,\"cpu_load_pct\":%.1f}",
+             "\"rms_x\":%.3f,\"rms_y\":%.3f,\"rms_z\":%.3f,\"rms_total\":%.3f,"
+             "\"peak_hz\":%.2f,\"peak_amp\":%.3f,\"peak_confidence_pct\":%.1f,\"rpm\":%.1f,"
+             "\"peak_confidence_threshold_pct\":%u,\"cpu_load_pct\":%.1f,"
+             "\"heap_free_bytes\":%lu,\"heap_used_bytes\":%lu,\"heap_total_bytes\":%lu}",
              millis(), wifiOk ? "true" : "false",
              wifiOk ? WiFi.localIP().toString().c_str() : "-",
              wifiOk ? WiFi.RSSI() : 0,
-             g_samples, g_lastX, g_lastY, g_lastZ, g_lastMag, g_fftPeakHzFilt, g_fftPeakAmp, g_fftPeakConfidencePct,
-             g_fftPeakRpm, g_peakConfThreshPct, g_cpuLoadPct);
+             g_samples, g_lastX, g_lastY, g_lastZ, g_lastMag, g_rmsX, g_rmsY, g_rmsZ, g_rmsTotal,
+             g_fftPeakHzFilt, g_fftPeakAmp, g_fftPeakConfidencePct,
+             g_fftPeakRpm, g_peakConfThreshPct, g_cpuLoadPct,
+             (unsigned long)heapFree, (unsigned long)heapUsed, (unsigned long)heapTotal);
 #else
     snprintf(json, sizeof(json),
-             "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,\"heap\":%u,\"peak_confidence_threshold_pct\":%u,\"cpu_load_pct\":%.1f}",
+             "{\"uptime_ms\":%lu,\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,\"heap\":%u,"
+             "\"peak_confidence_threshold_pct\":%u,\"cpu_load_pct\":%.1f,"
+             "\"heap_free_bytes\":%lu,\"heap_used_bytes\":%lu,\"heap_total_bytes\":%lu}",
              millis(), wifiOk ? "true" : "false",
              wifiOk ? WiFi.localIP().toString().c_str() : "-",
              wifiOk ? WiFi.RSSI() : 0,
              ESP.getFreeHeap(),
              g_peakConfThreshPct,
-             g_cpuLoadPct);
+             g_cpuLoadPct,
+             (unsigned long)heapFree, (unsigned long)heapUsed, (unsigned long)heapTotal);
 #endif
     server.send(200, "application/json", json);
 }
@@ -676,28 +860,55 @@ static void handleConfigJson() {
 #if ENABLE_ADXL
         applyOdr((uint16_t)max(0, (int)server.arg("odr_hz").toInt()));
 #endif
+    } else if (server.hasArg("trend_window_sec")) {
+        int v = server.arg("trend_window_sec").toInt();
+        if (v < 5) v = 5;
+        if (v > 60) v = 60;
+        g_trendWindowSec = (uint8_t)v;
+        Serial.printf("[CFG] trend_window_sec=%u\n", g_trendWindowSec);
+    } else if (server.hasArg("fft_n")) {
+#if ENABLE_ADXL
+        applyFftN((uint16_t)max(0, (int)server.arg("fft_n").toInt()));
+#endif
     }
 
-    char json[224];
-    const float binHz = (float)g_actualFs / (float)CONFIG_FFT_SIZE;
+    uint16_t nOptions[8] = {0};
+    const uint8_t nOptionsCount = getFftNOptions(nOptions, 8);
+
+    char json[320];
+    const float binHz = (float)g_actualFs / (float)g_fftNActive;
     const float harmToleranceHz = g_harmWindowBins * binHz;
     snprintf(json, sizeof(json),
-             "{\"peak_confidence_threshold_pct\":%u,\"harm_ratio_thresh_pct\":%u,\"harm_max_order\":%u,\"harm_window_bins\":%u,\"harm_tolerance_hz\":%.3f,\"odr_hz\":%u}",
-             g_peakConfThreshPct, g_harmRatioThreshPct, g_harmMaxOrder, g_harmWindowBins, harmToleranceHz, g_actualFs);
-    server.send(200, "application/json", json);
+             "{\"peak_confidence_threshold_pct\":%u,\"harm_ratio_thresh_pct\":%u,\"harm_max_order\":%u,\"harm_window_bins\":%u,\"harm_tolerance_hz\":%.3f,\"odr_hz\":%u,\"trend_window_sec\":%u,\"fft_n\":%u,\"fft_n_max\":%u",
+             g_peakConfThreshPct, g_harmRatioThreshPct, g_harmMaxOrder, g_harmWindowBins, harmToleranceHz,
+             g_actualFs, g_trendWindowSec, g_fftNActive, (uint16_t)CONFIG_FFT_SIZE);
+
+    String resp = json;
+    resp += F(",\"fft_n_options\":[");
+    for (uint8_t i = 0; i < nOptionsCount; i++) {
+        if (i) resp += ',';
+        resp += nOptions[i];
+    }
+    resp += F("]}");
+    server.send(200, "application/json", resp);
 }
 
 static void handleFftJson() {
     if (!ensureWebAuth()) return;
 
     String resp;
-    resp.reserve(1400);
+    resp.reserve(1800);
+    const uint16_t nActive = g_fftNActive;
     resp += F("{\"fs\":");
     resp += g_actualFs;
     resp += F(",\"n\":");
-    resp += (CONFIG_FFT_SIZE / 2);
+    resp += (nActive / 2);
+    resp += F(",\"fft_n\":");
+    resp += nActive;
     resp += F(",\"resolution\":");
-    resp += ((float)g_actualFs / CONFIG_FFT_SIZE);
+    resp += ((float)g_actualFs / nActive);
+    resp += F(",\"trend_window_sec\":");
+    resp += g_trendWindowSec;
 #if ENABLE_ADXL
     resp += F(",\"peak_hz\":");
     resp += g_fftPeakHz;
@@ -726,11 +937,11 @@ static void handleFftJson() {
     resp += F(",\"harm_window_bins\":");
     resp += g_harmWindowBins;
     resp += F(",\"harm_tolerance_hz\":");
-    resp += (g_harmWindowBins * ((float)g_actualFs / CONFIG_FFT_SIZE));
+    resp += (g_harmWindowBins * ((float)g_actualFs / nActive));
     resp += F(",\"harm_max_order\":");
     resp += g_harmMaxOrder;
     resp += F(",\"mag\":[");
-    for (uint16_t i = 0; i < CONFIG_FFT_SIZE / 2; i++) {
+    for (uint16_t i = 0; i < (nActive / 2); i++) {
         if (i) resp += ',';
         resp += g_fftMag[i];
     }
@@ -781,6 +992,7 @@ static void handleRoot() {
         .value { font-size: 1.06rem; font-weight: 650; margin-top: 4px; }
         .mono { font-family: Consolas, "Courier New", monospace; }
         #fftCanvas { width: 100%; height: 180px; background: #f8fafc; border-radius: 8px; display: block; }
+        #trendCanvas { width: 100%; height: 140px; background: #f8fafc; border-radius: 8px; display: block; }
         .cfg-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
         .cfg-row input[type="number"] { width: 84px; padding: 4px 6px; }
         .cfg-row button { padding: 5px 10px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; }
@@ -859,15 +1071,24 @@ static void handleRoot() {
                 <div><div class="label">RSSI</div><div class="value" id="rssi">-</div></div>
                 <div><div class="label">Uptime [ms]</div><div class="value mono" id="uptime">-</div></div>
                 <div><div class="label">CPU [%]</div><div class="value mono" id="cpu">-</div></div>
+                <div><div class="label">Heap free [KB]</div><div class="value mono" id="heapFree">-</div></div>
+                <div><div class="label">Heap used [KB]</div><div class="value mono" id="heapUsed">-</div></div>
+                <div><div class="label">Heap total [KB]</div><div class="value mono" id="heapTotal">-</div></div>
             </div>
         </div>
 
         <div class="card">
             <div class="grid">
-                <div><div class="label">X [m/s2]</div><div class="value mono" id="x">-</div></div>
-                <div><div class="label">Y [m/s2]</div><div class="value mono" id="y">-</div></div>
-                <div><div class="label">Z [m/s2]</div><div class="value mono" id="z">-</div></div>
-                <div><div class="label">Vibration [m/s2]</div><div class="value mono" id="v">-</div></div>
+                <div><div class="label">Acc X chwilowe [m/s2]</div><div class="value mono" id="x">-</div></div>
+                <div><div class="label">Acc Y chwilowe [m/s2]</div><div class="value mono" id="y">-</div></div>
+                <div><div class="label">Acc Z chwilowe [m/s2]</div><div class="value mono" id="z">-</div></div>
+                <div><div class="label">Modul chwilowy [m/s2]</div><div class="value mono" id="v">-</div></div>
+            </div>
+            <div class="grid" style="margin-top:8px">
+                <div><div class="label">Drgania RMS X (AC) [m/s2]</div><div class="value mono" id="rmsX">-</div></div>
+                <div><div class="label">Drgania RMS Y (AC) [m/s2]</div><div class="value mono" id="rmsY">-</div></div>
+                <div><div class="label">Drgania RMS Z (AC) [m/s2]</div><div class="value mono" id="rmsZ">-</div></div>
+                <div><div class="label">Drgania RMS Total [m/s2]</div><div class="value mono" id="rmsT">-</div></div>
             </div>
             <p class="label">Probek: <span class="mono" id="samples">-</span> | Peak FFT: <span class="mono" id="peak">-</span> | RPM: <span class="mono" id="rpm">-</span></p>
             <div class="cfg-row">
@@ -900,6 +1121,24 @@ static void handleRoot() {
                 <button id="saveOdr" type="button">Ustaw</button>
                 <span class="muted">Rozdzielczosc: <span class="mono" id="fftRes2">-</span> Hz/bin</span>
             </div>
+            <div class="cfg-row">
+                <span class="label">FFT N</span>
+                <select id="fftNSelect"></select>
+                <button id="saveFftN" type="button">Ustaw</button>
+                <span class="muted">Dostepne N: potegi 2 (64..max)</span>
+            </div>
+            <div class="cfg-row">
+                <span class="label">Trend [s]</span>
+                <input id="trendSec" type="number" min="5" max="60" step="1" value="30" />
+                <button id="saveTrendSec" type="button">Ustaw</button>
+                <span class="muted">Zakres 5-60 s</span>
+            </div>
+        </div>
+
+        <div class="card">
+            <div style="font-size:.9rem;font-weight:600;color:#334155;margin-bottom:6px">Trend RMS (ostatnie <span id="trendLbl">30</span>s)</div>
+            <canvas id="trendCanvas"></canvas>
+            <p class="label">Linie: X (czerwona), Y (zielona), Z (niebieska), Total (czarna)</p>
         </div>
 
         <div class="card">
@@ -919,7 +1158,11 @@ static void handleRoot() {
             <h3>Szerokosc okna harmonicznych [biny]</h3>
             <p>Polowa okna wyszukiwania maksimum harmonicznej wokol czestotliwosci docelowej. Dla wartosci 2 szukamy od -2 do +2 binow. Tolerancja w Hz zalezy od Fs oraz N i jest liczona na biezaco.</p>
             <h3>ODR czujnika [Hz]</h3>
-            <p>Czestotliwosc probkowania ADXL345 i jednoczesnie Fs analizy FFT. Wieksze ODR daje szersze pasmo, mniejsze ODR poprawia rozdzielczosc czestotliwosci dla stalego N=256.</p>
+            <p>Czestotliwosc probkowania ADXL345 i jednoczesnie Fs analizy FFT. Wieksze ODR daje szersze pasmo, mniejsze ODR poprawia rozdzielczosc czestotliwosci dla aktualnie ustawionego N.</p>
+            <h3>FFT N</h3>
+            <p>Liczba probek okna FFT. Wieksze N poprawia rozdzielczosc czestotliwosci, ale wydluza czas jednego okna i opoznia odswiezanie.</p>
+            <h3>Trend [s]</h3>
+            <p>Zakres czasu historii wykresu RMS. Parametr ustawiany tylko przez WWW, zakres 5..60 sekund.</p>
             <div class="modal-actions">
                 <button id="closeParamGuide" type="button">Zamknij</button>
             </div>
@@ -930,12 +1173,16 @@ static void handleRoot() {
         const $ = id => document.getElementById(id);
         const fc = $('fftCanvas');
         const fctx = fc.getContext('2d');
+        const tc = $('trendCanvas');
+        const tctx = tc.getContext('2d');
         const miniHelp = $('miniHelp');
         const paramGuideModal = $('paramGuideModal');
         let peakConfidenceThresholdPct = 60;
         let peakConfidencePct = 0;
         let harmRatioThreshPct = 30;
         let harmWindowBins = 2;
+        let trendWindowSec = 30;
+        const trendPoints = [];
 
         const miniHelpTexts = {
             wifi: 'Stan polaczenia ESP32 z siecia Wi-Fi.',
@@ -943,10 +1190,17 @@ static void handleRoot() {
             rssi: 'Sila sygnalu Wi-Fi w dBm. Blizej 0 oznacza mocniejszy sygnal.',
             uptime: 'Czas pracy od ostatniego restartu [ms].',
             cpu: 'Przyblizone obciazenie toru pomiar+FFT wzgledem budzetu czasowego probkowania [%].',
+            heapFree: 'Wolna pamiec sterty ESP (heap).',
+            heapUsed: 'Uzyta pamiec sterty ESP (heap).',
+            heapTotal: 'Calkowity rozmiar sterty ESP (heap).',
             x: 'Przyspieszenie osi X [m/s2].',
             y: 'Przyspieszenie osi Y [m/s2].',
             z: 'Przyspieszenie osi Z [m/s2].',
             v: 'Modul wektora drgan: sqrt(x^2 + y^2 + z^2).',
+            rmsX: 'Drgania RMS osi X (AC): skladowa zmienna, bez stalej grawitacyjnej.',
+            rmsY: 'Drgania RMS osi Y (AC): skladowa zmienna, bez stalej grawitacyjnej.',
+            rmsZ: 'Drgania RMS osi Z (AC): skladowa zmienna, bez stalej grawitacyjnej.',
+            rmsT: 'Wypadkowe drgania RMS: sqrt(rmsX^2 + rmsY^2 + rmsZ^2).',
             samples: 'Liczba pobranych probek od startu.',
             peak: 'Dominujaca czestotliwosc piku FFT po filtracji [Hz].',
             rpm: 'Obroty/min liczone z piku FFT i rzedu RPM.',
@@ -958,6 +1212,8 @@ static void handleRoot() {
             harmTol: 'Przeliczona tolerancja jednostronna: bins * Fs / N [Hz].',
             harmWinHz: 'Pelne okno analizy harmonicznej: 2 * tolerancja [Hz].',
             odrSelect: 'Konfigurowana czestotliwosc probkowania ADXL345 [Hz].',
+            fftNSelect: 'Aktywna liczba probek okna FFT (N).',
+            trendSec: 'Zakres czasu historii trendu RMS [s], tylko przez WWW (max 60).',
             fftRes2: 'Rozdzielczosc FFT wynikajaca z bieżącego Fs i N [Hz/bin].',
             fftFs: 'Aktualne Fs analizy FFT [Hz].',
             fftRes: 'Aktualna rozdzielczosc FFT [Hz/bin].',
@@ -998,6 +1254,64 @@ static void handleRoot() {
             if (!el) return;
             if (document.activeElement === el) return;
             el.value = valueStr;
+        }
+
+        function renderTrendChart() {
+            const dpr = window.devicePixelRatio || 1;
+            const W = tc.clientWidth;
+            const H = tc.clientHeight;
+            tc.width = W * dpr;
+            tc.height = H * dpr;
+            tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            tctx.clearRect(0, 0, W, H);
+
+            if (!trendPoints.length) return;
+            const now = Date.now();
+            const minTs = now - trendWindowSec * 1000;
+            while (trendPoints.length && trendPoints[0].ts < minTs) trendPoints.shift();
+            if (!trendPoints.length) return;
+
+            let yMax = 1e-6;
+            for (const p of trendPoints) {
+                yMax = Math.max(yMax, p.rx, p.ry, p.rz, p.rt);
+            }
+            const padL = 34;
+            const padT = 8;
+            const padB = 16;
+            const plotW = W - padL - 6;
+            const plotH = H - padT - padB;
+
+            tctx.strokeStyle = 'rgba(0,0,0,.08)';
+            tctx.beginPath();
+            tctx.moveTo(padL, padT + plotH);
+            tctx.lineTo(W - 6, padT + plotH);
+            tctx.moveTo(padL, padT);
+            tctx.lineTo(padL, padT + plotH);
+            tctx.stroke();
+
+            tctx.fillStyle = '#64748b';
+            tctx.font = '10px sans-serif';
+            tctx.fillText('0', 6, padT + plotH + 3);
+            tctx.fillText(yMax.toFixed(2), 2, padT + 8);
+
+            const drawLine = (key, color) => {
+                tctx.strokeStyle = color;
+                tctx.lineWidth = 1.4;
+                tctx.beginPath();
+                for (let i = 0; i < trendPoints.length; i++) {
+                    const p = trendPoints[i];
+                    const x = padL + ((p.ts - minTs) / (trendWindowSec * 1000)) * plotW;
+                    const y = padT + plotH - (p[key] / yMax) * plotH;
+                    if (i === 0) tctx.moveTo(x, y);
+                    else tctx.lineTo(x, y);
+                }
+                tctx.stroke();
+            };
+
+            drawLine('rx', '#ef4444');
+            drawLine('ry', '#16a34a');
+            drawLine('rz', '#2563eb');
+            drawLine('rt', '#0f172a');
         }
 
         async function saveErrorThreshold() {
@@ -1056,7 +1370,78 @@ static void handleRoot() {
                 const d = await r.json();
                 if (d.odr_hz) {
                     setValueIfNotFocused('odrSelect', String(d.odr_hz));
-                    $('fftRes2').textContent = (d.odr_hz / 256).toFixed(2);
+                    const nNow = Number(d.fft_n || $('fftNSelect').value || 256);
+                    $('fftRes2').textContent = (d.odr_hz / nNow).toFixed(2);
+                }
+            } catch (_) {
+            }
+        }
+
+        async function saveTrendWindowSec() {
+            const raw = Number($('trendSec').value);
+            const val = Number.isFinite(raw) ? Math.max(5, Math.min(60, Math.round(raw))) : trendWindowSec;
+            $('trendSec').value = String(val);
+            try {
+                const r = await fetch('/api/config?trend_window_sec=' + val, { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const d = await r.json();
+                if (typeof d.trend_window_sec === 'number') {
+                    trendWindowSec = Math.max(5, Math.min(60, Math.round(d.trend_window_sec)));
+                    setValueIfNotFocused('trendSec', String(trendWindowSec));
+                    $('trendLbl').textContent = String(trendWindowSec);
+                }
+            } catch (_) {
+            }
+        }
+
+        async function saveFftN() {
+            const val = Number($('fftNSelect').value);
+            try {
+                const r = await fetch('/api/config?fft_n=' + val, { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const d = await r.json();
+                if (typeof d.fft_n === 'number') {
+                    setValueIfNotFocused('fftNSelect', String(d.fft_n));
+                    $('fftN').textContent = Math.floor(d.fft_n / 2);
+                    $('fftRes2').textContent = ((d.odr_hz || 0) / d.fft_n).toFixed(2);
+                }
+            } catch (_) {
+            }
+        }
+
+        async function loadConfig() {
+            try {
+                const r = await fetch('/api/config', { cache: 'no-store' });
+                if (!r.ok) return;
+                const d = await r.json();
+                if (typeof d.trend_window_sec === 'number') {
+                    trendWindowSec = Math.max(5, Math.min(60, Math.round(d.trend_window_sec)));
+                    setValueIfNotFocused('trendSec', String(trendWindowSec));
+                    $('trendLbl').textContent = String(trendWindowSec);
+                }
+                if (typeof d.harm_ratio_thresh_pct === 'number') {
+                    harmRatioThreshPct = Number(d.harm_ratio_thresh_pct);
+                    setValueIfNotFocused('harmThr', String(harmRatioThreshPct));
+                }
+                if (typeof d.harm_window_bins === 'number') {
+                    harmWindowBins = Math.max(0, Math.min(32, Math.round(d.harm_window_bins)));
+                    setValueIfNotFocused('harmBins', String(harmWindowBins));
+                }
+                if (typeof d.odr_hz === 'number') {
+                    setValueIfNotFocused('odrSelect', String(d.odr_hz));
+                }
+                if (Array.isArray(d.fft_n_options)) {
+                    const sel = $('fftNSelect');
+                    sel.innerHTML = '';
+                    d.fft_n_options.forEach(n => {
+                        const o = document.createElement('option');
+                        o.value = String(n);
+                        o.textContent = String(n);
+                        sel.appendChild(o);
+                    });
+                }
+                if (typeof d.fft_n === 'number') {
+                    setValueIfNotFocused('fftNSelect', String(d.fft_n));
                 }
             } catch (_) {
             }
@@ -1072,10 +1457,25 @@ static void handleRoot() {
                 $('rssi').textContent = s.rssi + ' dBm';
                 $('uptime').textContent = s.uptime_ms;
                 $('cpu').textContent = (typeof s.cpu_load_pct === 'number') ? s.cpu_load_pct.toFixed(1) : '-';
+                $('heapFree').textContent = (typeof s.heap_free_bytes === 'number') ? (s.heap_free_bytes / 1024).toFixed(1) : '-';
+                $('heapUsed').textContent = (typeof s.heap_used_bytes === 'number') ? (s.heap_used_bytes / 1024).toFixed(1) : '-';
+                $('heapTotal').textContent = (typeof s.heap_total_bytes === 'number') ? (s.heap_total_bytes / 1024).toFixed(1) : '-';
                 $('x').textContent = s.x.toFixed(3);
                 $('y').textContent = s.y.toFixed(3);
                 $('z').textContent = s.z.toFixed(3);
                 $('v').textContent = s.vibration.toFixed(3);
+                $('rmsX').textContent = (s.rms_x || 0).toFixed(3);
+                $('rmsY').textContent = (s.rms_y || 0).toFixed(3);
+                $('rmsZ').textContent = (s.rms_z || 0).toFixed(3);
+                $('rmsT').textContent = (s.rms_total || 0).toFixed(3);
+                trendPoints.push({
+                    ts: Date.now(),
+                    rx: Number(s.rms_x || 0),
+                    ry: Number(s.rms_y || 0),
+                    rz: Number(s.rms_z || 0),
+                    rt: Number(s.rms_total || 0)
+                });
+                renderTrendChart();
                 $('samples').textContent = s.samples;
                 $('peak').textContent = (s.peak_hz || 0).toFixed(1) + ' Hz';
                 peakConfidencePct = Number(s.peak_confidence_pct || 0);
@@ -1093,6 +1493,13 @@ static void handleRoot() {
                 $('errConf').textContent = '0';
                 $('rpm').textContent = '0';
                 $('cpu').textContent = '-';
+                $('heapFree').textContent = '-';
+                $('heapUsed').textContent = '-';
+                $('heapTotal').textContent = '-';
+                $('rmsX').textContent = '-';
+                $('rmsY').textContent = '-';
+                $('rmsZ').textContent = '-';
+                $('rmsT').textContent = '-';
                 $('wifi').textContent = 'Blad odczytu';
             }
         }
@@ -1107,6 +1514,9 @@ static void handleRoot() {
                 $('fftRes').textContent = d.resolution.toFixed(2);
                 $('fftN').textContent = d.n;
                 $('fftBand').textContent = d.band_min_hz.toFixed(1) + '-' + d.band_max_hz.toFixed(1) + ' Hz';
+                if (typeof d.fft_n === 'number') {
+                    setValueIfNotFocused('fftNSelect', String(d.fft_n));
+                }
                 // Sync ODR dropdown and resolution hint
                 if (d.fs && $('odrSelect').value !== String(d.fs)) {
                     setValueIfNotFocused('odrSelect', String(d.fs));
@@ -1189,6 +1599,24 @@ static void handleRoot() {
                     $('harmTol').textContent = d.harm_tolerance_hz.toFixed(2);
                     $('harmWinHz').textContent = (2 * d.harm_tolerance_hz).toFixed(2);
                 }
+                if (typeof d.trend_window_sec === 'number') {
+                    trendWindowSec = Math.max(5, Math.min(60, Math.round(d.trend_window_sec)));
+                    setValueIfNotFocused('trendSec', String(trendWindowSec));
+                    $('trendLbl').textContent = String(trendWindowSec);
+                }
+                if (Array.isArray(d.fft_n_options)) {
+                    const sel = $('fftNSelect');
+                    if (!sel.dataset.inited || sel.options.length !== d.fft_n_options.length) {
+                        sel.innerHTML = '';
+                        d.fft_n_options.forEach(n => {
+                            const o = document.createElement('option');
+                            o.value = String(n);
+                            o.textContent = String(n);
+                            sel.appendChild(o);
+                        });
+                        sel.dataset.inited = '1';
+                    }
+                }
                 const harmLabels = ['2x', '3x', '4x'];
                 const harmStatus = [];
                 fctx.font = '10px sans-serif';
@@ -1216,6 +1644,7 @@ static void handleRoot() {
             }
         }
 
+        loadConfig();
         refreshStatus();
         refreshFFT();
         initMiniHelpTargets();
@@ -1223,6 +1652,8 @@ static void handleRoot() {
         $('saveHarmThr').addEventListener('click', saveHarmThreshold);
         $('saveHarmBins').addEventListener('click', saveHarmWindowBins);
         $('saveOdr').addEventListener('click', saveOdr);
+        $('saveTrendSec').addEventListener('click', saveTrendWindowSec);
+        $('saveFftN').addEventListener('click', saveFftN);
         $('openParamGuide').addEventListener('click', openParamGuide);
         $('closeParamGuide').addEventListener('click', closeParamGuide);
         paramGuideModal.addEventListener('click', e => {
@@ -1383,6 +1814,9 @@ void loop() {
         g_lastY = event.acceleration.y;
         g_lastZ = event.acceleration.z;
         g_lastMag = sqrtf(g_lastX * g_lastX + g_lastY * g_lastY + g_lastZ * g_lastZ);
+        g_winSumX += g_lastX;
+        g_winSumY += g_lastY;
+        g_winSumZ += g_lastZ;
         g_winSumSqX += g_lastX * g_lastX;
         g_winSumSqY += g_lastY * g_lastY;
         g_winSumSqZ += g_lastZ * g_lastZ;
@@ -1399,14 +1833,24 @@ void loop() {
         g_fftReal[g_fftIdx] = hpOut;
         g_fftImag[g_fftIdx] = 0.0f;
         g_fftIdx++;
-        if (g_fftIdx >= CONFIG_FFT_SIZE) {
+        if (g_fftIdx >= g_fftNActive) {
             g_fftIdx = 0;
             if (g_winSampleCount > 0) {
-                g_rmsX = sqrtf(g_winSumSqX / g_winSampleCount);
-                g_rmsY = sqrtf(g_winSumSqY / g_winSampleCount);
-                g_rmsZ = sqrtf(g_winSumSqZ / g_winSampleCount);
+                const float invN = 1.0f / g_winSampleCount;
+                const float meanX = g_winSumX * invN;
+                const float meanY = g_winSumY * invN;
+                const float meanZ = g_winSumZ * invN;
+                const float varX = max(0.0f, (g_winSumSqX * invN) - meanX * meanX);
+                const float varY = max(0.0f, (g_winSumSqY * invN) - meanY * meanY);
+                const float varZ = max(0.0f, (g_winSumSqZ * invN) - meanZ * meanZ);
+                g_rmsX = sqrtf(varX);
+                g_rmsY = sqrtf(varY);
+                g_rmsZ = sqrtf(varZ);
                 g_rmsTotal = sqrtf(g_rmsX * g_rmsX + g_rmsY * g_rmsY + g_rmsZ * g_rmsZ);
             }
+            g_winSumX = 0.0f;
+            g_winSumY = 0.0f;
+            g_winSumZ = 0.0f;
             g_winSumSqX = 0.0f;
             g_winSumSqY = 0.0f;
             g_winSumSqZ = 0.0f;
