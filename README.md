@@ -4,6 +4,18 @@
 
 A motor health monitoring system based on vibration analysis. The ADXL345 accelerometer (**SPI** interface) is mounted on the motor housing and provides raw X/Y/Z acceleration data. The ESP32 (WROOM) collects 256 samples at Fs = 800 Hz, runs FFT with an HP filter and spectrum smoothing, identifies the dominant vibration frequency and estimates **RPM**. The firmware also calculates **peak confidence** (how clearly the FFT peak stands out from the noise floor). RPM is forced to `0` when peak confidence is below a configurable threshold. Results are exposed through both a built-in HTTP server and a lightweight **Modbus TCP** server. The HTTP side provides a status page plus `/api/status`, `/api/fft`, and `/api/config` JSON endpoints, while Modbus TCP serves measurement and configuration registers on port `502`. Optionally, a 1.3" OLED (SH1106, I²C) displays X/Y/Z, RPM, and confidence.
 
+### Recent Runtime/UI Enhancements
+
+- Heap telemetry in `/api/status`: `heap_free_bytes`, `heap_used_bytes`, `heap_total_bytes`.
+- RMS trend chart in web UI (X/Y/Z/Total), with configurable time window.
+- Runtime trend window control via `/api/config?trend_window_sec=<5..60>`.
+- Runtime FFT length selection via `/api/config?fft_n=<power_of_two>` with options returned by the API.
+- Dynamic FFT metadata in `/api/fft` (`n`, `fft_n`, `trend_window_sec`, runtime `resolution`).
+
+### Dashboard Screenshot
+
+![Web dashboard](img/dashboard-2026-04-28.jpg)
+
 ---
 
 ## Hardware
@@ -88,12 +100,21 @@ I²C address: **0x3C** (configurable via `CONFIG_OLED_ADDR`).
   "wifi_connected": true,
   "ip": "192.168.1.x",
   "uptime_ms": 12345,
+  "heap_free_bytes": 243456,
+  "heap_used_bytes": 80720,
+  "heap_total_bytes": 324176,
+  "cpu_pct": 6.6,
   "x": 12.3,
   "y": -4.5,
   "z": 1002.1,
   "vibration": 1002.2,
+  "rms_x": 0.836,
+  "rms_y": 0.766,
+  "rms_z": 0.550,
+  "rms_total": 1.260,
   "samples": 4096,
   "peak_hz": 49.8,
+  "peak_hz_filt": 49.6,
   "peak_amp": 312.5,
   "peak_confidence_pct": 78.4,
   "peak_confidence_threshold_pct": 60,
@@ -107,6 +128,7 @@ I²C address: **0x3C** (configurable via `CONFIG_OLED_ADDR`).
 {
   "mag": [0.0, 0.1, "..."],
   "peak_hz": 49.8,
+  "peak_hz_filt": 49.6,
   "peak_amp": 312.5,
   "peak_confidence_pct": 78.4,
   "rpm": 2988,
@@ -114,7 +136,9 @@ I²C address: **0x3C** (configurable via `CONFIG_OLED_ADDR`).
   "band_max_hz": 300,
   "resolution": 3.125,
   "fs": 800,
-  "n": 256
+  "n": 256,
+  "fft_n": 256,
+  "trend_window_sec": 30
 }
 ```
 
@@ -124,13 +148,27 @@ Get current runtime config (currently confidence threshold):
 
 ```json
 {
-  "peak_confidence_threshold_pct": 60
+  "peak_confidence_threshold_pct": 60,
+  "harm_ratio_thresh_pct": 20,
+  "harm_window_bins": 2,
+  "odr_hz": 800,
+  "trend_window_sec": 30,
+  "fft_n": 256,
+  "fft_n_options": [64, 128, 256]
 }
 ```
 
 Set threshold from web/UI or client:
 
 `/api/config?peak_confidence_threshold_pct=70`
+
+Set trend window (seconds):
+
+`/api/config?trend_window_sec=45`
+
+Set active FFT length:
+
+`/api/config?fft_n=128`
 
 Compatibility alias is still accepted:
 
