@@ -57,10 +57,13 @@
 #define CONFIG_WIFI_RETRY_MS 10000
 #endif
 #ifndef CONFIG_FFT_SIZE
-#define CONFIG_FFT_SIZE 256
+#define CONFIG_FFT_SIZE 4096
+#endif
+#ifndef CONFIG_FFT_N_DEFAULT
+#define CONFIG_FFT_N_DEFAULT 512
 #endif
 #ifndef CONFIG_FFT_FS
-#define CONFIG_FFT_FS 800
+#define CONFIG_FFT_FS 400
 #endif
 #ifndef CONFIG_FFT_PEAK_MIN_HZ
 #define CONFIG_FFT_PEAK_MIN_HZ 5.0f
@@ -120,6 +123,7 @@ static uint16_t g_trendThresholdPct = CONFIG_TREND_THRESHOLD_PCT;
 static uint16_t g_fftBandMinHz = (uint16_t)CONFIG_FFT_PEAK_MIN_HZ;
 static uint16_t g_fftBandMaxHz = (uint16_t)CONFIG_FFT_PEAK_MAX_HZ;
 static uint16_t g_rpmOrder = (uint16_t)CONFIG_RPM_ORDER;
+static float g_manualRefRpm = 0.0f;
 static uint16_t g_alarmFlags = 0;
 static bool g_sensorPresent = ENABLE_ADXL != 0;
 static uint8_t g_trendWindowSec = CONFIG_TREND_WINDOW_SEC_DEFAULT;
@@ -134,6 +138,20 @@ static void oledMsg(const char* line1, const char* line2 = nullptr);
 #endif
 
 #if ENABLE_ADXL
+enum {
+    FFT_AXIS_X = 0,
+    FFT_AXIS_Y = 1,
+    FFT_AXIS_Z = 2,
+    FFT_AXIS_RESULTANT = 3,
+    FFT_AXIS_COUNT = 4
+};
+
+static const uint8_t FFT_ANALYTICS_X = 1u << FFT_AXIS_X;
+static const uint8_t FFT_ANALYTICS_Y = 1u << FFT_AXIS_Y;
+static const uint8_t FFT_ANALYTICS_Z = 1u << FFT_AXIS_Z;
+static const uint8_t FFT_ANALYTICS_RESULTANT = 1u << FFT_AXIS_RESULTANT;
+static const uint8_t FFT_ANALYTICS_ALL = FFT_ANALYTICS_X | FFT_ANALYTICS_Y | FFT_ANALYTICS_Z | FFT_ANALYTICS_RESULTANT;
+
 static float g_lastX = 0.0f;
 static float g_lastY = 0.0f;
 static float g_lastZ = 0.0f;
@@ -144,11 +162,21 @@ static unsigned long g_lastSensorLogMs = 0;
 static uint32_t g_lastSampleUs = 0;
 static uint32_t g_samplePeriodUs = 1000000UL / CONFIG_FFT_FS;
 static uint16_t g_actualFs = CONFIG_FFT_FS;
-static uint16_t g_fftNActive = CONFIG_FFT_SIZE;
+static uint16_t g_fftNActive = (CONFIG_FFT_N_DEFAULT <= CONFIG_FFT_SIZE) ? CONFIG_FFT_N_DEFAULT : CONFIG_FFT_SIZE;
+static uint8_t g_fftAnalyticsMask = FFT_ANALYTICS_Z;
+static uint8_t g_fftPrimaryAxis = FFT_AXIS_Z;
 
-static float g_fftReal[CONFIG_FFT_SIZE];
-static float g_fftImag[CONFIG_FFT_SIZE];
+static const float FFT_INPUT_SCALE = 512.0f;
+static const float FFT_INPUT_INV_SCALE = 1.0f / FFT_INPUT_SCALE;
+static int16_t g_fftInX[CONFIG_FFT_SIZE];
+static int16_t g_fftInY[CONFIG_FFT_SIZE];
+static int16_t g_fftInZ[CONFIG_FFT_SIZE];
+static int16_t g_fftInResultant[CONFIG_FFT_SIZE];
+static float g_fftWorkReal[CONFIG_FFT_SIZE];
+static float g_fftWorkImag[CONFIG_FFT_SIZE];
 static float g_fftMag[CONFIG_FFT_SIZE / 2];
+static float g_fftAxisPeakHz[FFT_AXIS_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+static float g_fftAxisPeakAmp[FFT_AXIS_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static float g_fftPeakHz = 0.0f;
 static float g_fftPeakHzFilt = 0.0f;
 static float g_fftPeakAmp = 0.0f;
@@ -198,6 +226,11 @@ static int16_t clampToI16(long value) {
     return (int16_t)value;
 }
 
+static float getManualRefHz() {
+    if (g_manualRefRpm <= 0.0f) return 0.0f;
+    return (g_manualRefRpm * max<uint16_t>(1, g_rpmOrder)) / 60.0f;
+}
+
 static bool isValidFftN(uint16_t n) {
     if (n < 64 || n > CONFIG_FFT_SIZE) return false;
     return (n & (n - 1)) == 0;
@@ -240,9 +273,15 @@ static void resetAnalysisState() {
     g_harmonicAmp[1] = 0.0f;
     g_harmonicAmp[2] = 0.0f;
     g_harmonicAlarmFlags = 0;
-    memset(g_fftReal, 0, sizeof(g_fftReal));
-    memset(g_fftImag, 0, sizeof(g_fftImag));
+    memset(g_fftInX, 0, sizeof(g_fftInX));
+    memset(g_fftInY, 0, sizeof(g_fftInY));
+    memset(g_fftInZ, 0, sizeof(g_fftInZ));
+    memset(g_fftInResultant, 0, sizeof(g_fftInResultant));
+    memset(g_fftWorkReal, 0, sizeof(g_fftWorkReal));
+    memset(g_fftWorkImag, 0, sizeof(g_fftWorkImag));
     memset(g_fftMag, 0, sizeof(g_fftMag));
+    memset(g_fftAxisPeakHz, 0, sizeof(g_fftAxisPeakHz));
+    memset(g_fftAxisPeakAmp, 0, sizeof(g_fftAxisPeakAmp));
 }
 
 static void applyFftN(uint16_t n) {
@@ -322,46 +361,159 @@ static void updateAlarmFlags() {
     g_alarmFlags |= (uint16_t)(g_harmonicAlarmFlags << 5);
 }
 
+static uint8_t resolveFftPrimaryAxis() {
+    if ((g_fftAnalyticsMask & FFT_ANALYTICS_ALL) == 0u) {
+        return FFT_AXIS_Z;
+    }
+    if ((g_fftPrimaryAxis < FFT_AXIS_COUNT) && (g_fftAnalyticsMask & (1u << g_fftPrimaryAxis))) {
+        return g_fftPrimaryAxis;
+    }
+    for (uint8_t axis = 0; axis < FFT_AXIS_COUNT; axis++) {
+        if (g_fftAnalyticsMask & (1u << axis)) {
+            return axis;
+        }
+    }
+    return FFT_AXIS_Z;
+}
+
+static void computeMagnitudeForAxis(const int16_t* input, float* magOut, uint16_t nActive) {
+    float mean = 0.0f;
+    for (uint16_t i = 0; i < nActive; i++) {
+        mean += (float)input[i] * FFT_INPUT_INV_SCALE;
+    }
+    mean /= nActive;
+
+    for (uint16_t i = 0; i < nActive; i++) {
+        g_fftWorkReal[i] = ((float)input[i] * FFT_INPUT_INV_SCALE) - mean;
+        g_fftWorkImag[i] = 0.0f;
+    }
+
+    ArduinoFFT<float> fft(g_fftWorkReal, g_fftWorkImag, nActive, (float)g_actualFs);
+    fft.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+    fft.compute(FFTDirection::Forward);
+    fft.complexToMagnitude();
+
+    const uint16_t halfN = nActive / 2;
+    const float norm = 2.0f / (float)nActive;
+    const float magAlpha = 0.22f;
+    magOut[0] = 0.0f;
+    for (uint16_t i = 1; i < halfN; i++) {
+        const float magNow = g_fftWorkReal[i] * norm;
+        magOut[i] = (1.0f - magAlpha) * magOut[i] + magAlpha * magNow;
+    }
+}
+
+static void updateAxisPeakFromMag(uint8_t axis, const float* mag, uint16_t nActive, uint16_t minBin, uint16_t maxBin, float binHz) {
+    float peakAmp = 0.0f;
+    uint16_t peakBin = minBin;
+    for (uint16_t i = minBin; i <= maxBin; i++) {
+        if (mag[i] > peakAmp) {
+            peakAmp = mag[i];
+            peakBin = i;
+        }
+    }
+    g_fftAxisPeakAmp[axis] = peakAmp;
+    g_fftAxisPeakHz[axis] = peakBin * binHz;
+}
+
+static void computeAxisPeakOnly(uint8_t axis, const int16_t* input, uint16_t nActive, uint16_t minBin, uint16_t maxBin, float binHz) {
+    float mean = 0.0f;
+    for (uint16_t i = 0; i < nActive; i++) {
+        mean += (float)input[i] * FFT_INPUT_INV_SCALE;
+    }
+    mean /= nActive;
+
+    for (uint16_t i = 0; i < nActive; i++) {
+        g_fftWorkReal[i] = ((float)input[i] * FFT_INPUT_INV_SCALE) - mean;
+        g_fftWorkImag[i] = 0.0f;
+    }
+
+    ArduinoFFT<float> fft(g_fftWorkReal, g_fftWorkImag, nActive, (float)g_actualFs);
+    fft.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+    fft.compute(FFTDirection::Forward);
+    fft.complexToMagnitude();
+
+    const float norm = 2.0f / (float)nActive;
+    float peakAmp = 0.0f;
+    uint16_t peakBin = minBin;
+    for (uint16_t i = minBin; i <= maxBin; i++) {
+        const float magNow = g_fftWorkReal[i] * norm;
+        if (magNow > peakAmp) {
+            peakAmp = magNow;
+            peakBin = i;
+        }
+    }
+    g_fftAxisPeakAmp[axis] = peakAmp;
+    g_fftAxisPeakHz[axis] = peakBin * binHz;
+}
+
 static void computeFFT() {
     if (!isValidFftN(g_fftNActive)) {
         g_fftNActive = CONFIG_FFT_SIZE;
     }
     const uint16_t nActive = g_fftNActive;
-
-    float mean = 0.0f;
-    for (uint16_t i = 0; i < nActive; i++) {
-        mean += g_fftReal[i];
-    }
-    mean /= nActive;
-
-    for (uint16_t i = 0; i < nActive; i++) {
-        g_fftReal[i] -= mean;
-        g_fftImag[i] = 0.0f;
-    }
-
-    ArduinoFFT<float> fft(g_fftReal, g_fftImag, nActive, (float)g_actualFs);
-    fft.windowing(FFTWindow::Hamming, FFTDirection::Forward);
-    fft.compute(FFTDirection::Forward);
-    fft.complexToMagnitude();
-
-    const float binHz = (float)g_actualFs / (float)nActive;
     const uint16_t halfN = nActive / 2;
+    const float binHz = (float)g_actualFs / (float)nActive;
+
     uint16_t minBin = (uint16_t)((float)g_fftBandMinHz / binHz);
     uint16_t maxBin = (uint16_t)((float)g_fftBandMaxHz / binHz);
     if (minBin < 1) minBin = 1;
     if (maxBin >= (halfN - 1)) maxBin = halfN - 1;
-    const float norm = 2.0f / (float)nActive;
-    const float magAlpha = 0.22f;
+
+    const uint8_t mask = g_fftAnalyticsMask & FFT_ANALYTICS_ALL;
+    if (mask == 0u) {
+        memset(g_fftMag, 0, sizeof(g_fftMag));
+        g_fftAxisPeakHz[FFT_AXIS_X] = 0.0f;
+        g_fftAxisPeakHz[FFT_AXIS_Y] = 0.0f;
+        g_fftAxisPeakHz[FFT_AXIS_Z] = 0.0f;
+        g_fftAxisPeakHz[FFT_AXIS_RESULTANT] = 0.0f;
+        g_fftAxisPeakAmp[FFT_AXIS_X] = 0.0f;
+        g_fftAxisPeakAmp[FFT_AXIS_Y] = 0.0f;
+        g_fftAxisPeakAmp[FFT_AXIS_Z] = 0.0f;
+        g_fftAxisPeakAmp[FFT_AXIS_RESULTANT] = 0.0f;
+        g_fftPeakHz = 0.0f;
+        g_fftPeakAmp = 0.0f;
+        g_fftPeakHzFilt = 0.0f;
+        g_fftPeakConfidencePct = 0.0f;
+        g_fftPeakRpm = 0.0f;
+        g_prevFundHz = 0.0f;
+        g_harmonicAlarmFlags = 0;
+        g_harmonicAmp[0] = 0.0f;
+        g_harmonicAmp[1] = 0.0f;
+        g_harmonicAmp[2] = 0.0f;
+        updateAlarmFlags();
+        return;
+    }
+
+    const uint8_t activeAxis = resolveFftPrimaryAxis();
+    g_fftPrimaryAxis = activeAxis;
+
+    auto processAxis = [&](uint8_t axis, const int16_t* input) {
+        if (!(mask & (1u << axis))) {
+            g_fftAxisPeakHz[axis] = 0.0f;
+            g_fftAxisPeakAmp[axis] = 0.0f;
+            return;
+        }
+
+        if (axis == activeAxis) {
+            computeMagnitudeForAxis(input, g_fftMag, nActive);
+            updateAxisPeakFromMag(axis, g_fftMag, nActive, minBin, maxBin, binHz);
+        } else {
+            computeAxisPeakOnly(axis, input, nActive, minBin, maxBin, binHz);
+        }
+    };
+
+    processAxis(FFT_AXIS_X, g_fftInX);
+    processAxis(FFT_AXIS_Y, g_fftInY);
+    processAxis(FFT_AXIS_Z, g_fftInZ);
+    processAxis(FFT_AXIS_RESULTANT, g_fftInResultant);
 
     uint16_t peakBin = minBin;
     float peakAmp = 0.0f;
     float noiseSum = 0.0f;
     uint16_t noiseCount = 0;
-    g_fftMag[0] = 0.0f;
 
     for (uint16_t i = 1; i < halfN; i++) {
-        const float magNow = g_fftReal[i] * norm;
-        g_fftMag[i] = (1.0f - magAlpha) * g_fftMag[i] + magAlpha * magNow;
         if (i >= minBin && i <= maxBin && g_fftMag[i] > peakAmp) {
             peakAmp = g_fftMag[i];
             peakBin = i;
@@ -369,7 +521,15 @@ static void computeFFT() {
     }
 
     // Step 1: build candidate fundamentals from strongest line and its subharmonics.
-    uint16_t candidates[4] = {peakBin, (uint16_t)(peakBin / 2), (uint16_t)(peakBin / 3), 0};
+    uint16_t candidates[6] = {peakBin, (uint16_t)(peakBin / 2), (uint16_t)(peakBin / 3), 0, 0, 0};
+    const float manualRefHz = getManualRefHz();
+    if (manualRefHz > 0.0f) {
+        uint16_t refBin = (uint16_t)lroundf(manualRefHz / binHz);
+        refBin = constrain(refBin, minBin, maxBin);
+        candidates[3] = refBin;
+        candidates[4] = (uint16_t)constrain((int)(refBin / 2), (int)minBin, (int)maxBin);
+        candidates[5] = (uint16_t)constrain((int)(refBin * 2), (int)minBin, (int)maxBin);
+    }
 
     auto localPeak = [&](uint16_t center, uint16_t& outBin) -> float {
         if (center < minBin) center = minBin;
@@ -422,6 +582,16 @@ static void computeFFT() {
             else if (rel >= 0.70f) score -= 0.20f * a1;
         }
 
+        if (manualRefHz > 0.0f) {
+            const float candHz = b1 * binHz;
+            const float relRef = fabsf(candHz - manualRefHz) / (manualRefHz + 1e-6f);
+            // Jeśli peak jest bardzo blisko referencji, wymuś bardzo wysoki score
+            if (relRef <= 0.04f) score += 100.0f * a1;
+            else if (relRef <= 0.08f) score += 0.80f * a1;
+            else if (relRef <= 0.20f) score += 0.30f * a1;
+            else if (relRef >= 0.60f) score -= 0.25f * a1;
+        }
+
         outBin = b1;
         outA1 = a1;
         return score;
@@ -431,7 +601,7 @@ static void computeFFT() {
     float bestScore = -1e9f;
     uint16_t bestBin = peakBin;
     float bestAmp = peakAmp;
-    for (uint8_t ci = 0; ci < 3; ci++) {
+    for (uint8_t ci = 0; ci < 6; ci++) {
         const uint16_t cand = candidates[ci];
         if (cand <= minBin || cand >= maxBin) continue;
         bool duplicate = false;
@@ -790,6 +960,17 @@ static bool ensureWebAuth() {
     return true;
 }
 
+// Resetuje bufory i liczniki analizy FFT i RMS bez zmiany parametrów.
+static void handleResetAnalysis() {
+    if (!ensureWebAuth()) return;
+#if ENABLE_ADXL
+    resetAnalysisState();
+    g_samples = 0;
+    Serial.println("[RESET] Bufory i liczniki analizy zresetowane przez WWW");
+#endif
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
 static void handleStatusJson() {
     if (!ensureWebAuth()) return;
 
@@ -804,14 +985,14 @@ static void handleStatusJson() {
              "\"samples\":%lu,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"vibration\":%.3f,"
              "\"rms_x\":%.3f,\"rms_y\":%.3f,\"rms_z\":%.3f,\"rms_total\":%.3f,"
              "\"peak_hz\":%.2f,\"peak_amp\":%.3f,\"peak_confidence_pct\":%.1f,\"rpm\":%.1f,"
-             "\"peak_confidence_threshold_pct\":%u,\"cpu_load_pct\":%.1f,"
+             "\"peak_confidence_threshold_pct\":%u,\"manual_ref_rpm\":%.1f,\"cpu_load_pct\":%.1f,"
              "\"heap_free_bytes\":%lu,\"heap_used_bytes\":%lu,\"heap_total_bytes\":%lu}",
              millis(), wifiOk ? "true" : "false",
              wifiOk ? WiFi.localIP().toString().c_str() : "-",
              wifiOk ? WiFi.RSSI() : 0,
              g_samples, g_lastX, g_lastY, g_lastZ, g_lastMag, g_rmsX, g_rmsY, g_rmsZ, g_rmsTotal,
              g_fftPeakHzFilt, g_fftPeakAmp, g_fftPeakConfidencePct,
-             g_fftPeakRpm, g_peakConfThreshPct, g_cpuLoadPct,
+             g_fftPeakRpm, g_peakConfThreshPct, g_manualRefRpm, g_cpuLoadPct,
              (unsigned long)heapFree, (unsigned long)heapUsed, (unsigned long)heapTotal);
 #else
     snprintf(json, sizeof(json),
@@ -870,18 +1051,38 @@ static void handleConfigJson() {
 #if ENABLE_ADXL
         applyFftN((uint16_t)max(0, (int)server.arg("fft_n").toInt()));
 #endif
+    } else if (server.hasArg("manual_ref_rpm")) {
+        float v = server.arg("manual_ref_rpm").toFloat();
+        if (!isfinite(v) || v < 0.0f) v = 0.0f;
+        if (v > 120000.0f) v = 120000.0f;
+        g_manualRefRpm = v;
+        Serial.printf("[CFG] manual_ref_rpm=%.1f\n", g_manualRefRpm);
+    } else if (server.hasArg("fft_analytics_mask")) {
+        int v = server.arg("fft_analytics_mask").toInt();
+        if (v < 0) v = 0;
+        if (v > 15) v = 15;
+        g_fftAnalyticsMask = (uint8_t)v;
+        resetAnalysisState();
+        Serial.printf("[CFG] fft_analytics_mask=0x%X\n", g_fftAnalyticsMask);
+    } else if (server.hasArg("fft_primary_axis")) {
+        int v = server.arg("fft_primary_axis").toInt();
+        if (v < 0) v = 0;
+        if (v >= FFT_AXIS_COUNT) v = FFT_AXIS_COUNT - 1;
+        g_fftPrimaryAxis = (uint8_t)v;
+        Serial.printf("[CFG] fft_primary_axis=%u\n", g_fftPrimaryAxis);
     }
 
     uint16_t nOptions[8] = {0};
     const uint8_t nOptionsCount = getFftNOptions(nOptions, 8);
 
-    char json[320];
+    char json[420];
     const float binHz = (float)g_actualFs / (float)g_fftNActive;
     const float harmToleranceHz = g_harmWindowBins * binHz;
     snprintf(json, sizeof(json),
-             "{\"peak_confidence_threshold_pct\":%u,\"harm_ratio_thresh_pct\":%u,\"harm_max_order\":%u,\"harm_window_bins\":%u,\"harm_tolerance_hz\":%.3f,\"odr_hz\":%u,\"trend_window_sec\":%u,\"fft_n\":%u,\"fft_n_max\":%u",
-             g_peakConfThreshPct, g_harmRatioThreshPct, g_harmMaxOrder, g_harmWindowBins, harmToleranceHz,
-             g_actualFs, g_trendWindowSec, g_fftNActive, (uint16_t)CONFIG_FFT_SIZE);
+             "{\"peak_confidence_threshold_pct\":%u,\"manual_ref_rpm\":%.1f,\"harm_ratio_thresh_pct\":%u,\"harm_max_order\":%u,\"harm_window_bins\":%u,\"harm_tolerance_hz\":%.3f,\"odr_hz\":%u,\"trend_window_sec\":%u,\"fft_n\":%u,\"fft_n_max\":%u,\"fft_analytics_mask\":%u,\"fft_primary_axis\":%u",
+             g_peakConfThreshPct, g_manualRefRpm, g_harmRatioThreshPct, g_harmMaxOrder, g_harmWindowBins, harmToleranceHz,
+             g_actualFs, g_trendWindowSec, g_fftNActive, (uint16_t)CONFIG_FFT_SIZE,
+             g_fftAnalyticsMask, g_fftPrimaryAxis);
 
     String resp = json;
     resp += F(",\"fft_n_options\":[");
@@ -910,6 +1111,22 @@ static void handleFftJson() {
     resp += F(",\"trend_window_sec\":");
     resp += g_trendWindowSec;
 #if ENABLE_ADXL
+    resp += F(",\"fft_analytics_mask\":");
+    resp += g_fftAnalyticsMask;
+    resp += F(",\"fft_primary_axis\":");
+    resp += g_fftPrimaryAxis;
+    resp += F(",\"axis_peak_hz\":[");
+    resp += g_fftAxisPeakHz[FFT_AXIS_X]; resp += ',';
+    resp += g_fftAxisPeakHz[FFT_AXIS_Y]; resp += ',';
+    resp += g_fftAxisPeakHz[FFT_AXIS_Z]; resp += ',';
+    resp += g_fftAxisPeakHz[FFT_AXIS_RESULTANT];
+    resp += F("]");
+    resp += F(",\"axis_peak_amp\":[");
+    resp += g_fftAxisPeakAmp[FFT_AXIS_X]; resp += ',';
+    resp += g_fftAxisPeakAmp[FFT_AXIS_Y]; resp += ',';
+    resp += g_fftAxisPeakAmp[FFT_AXIS_Z]; resp += ',';
+    resp += g_fftAxisPeakAmp[FFT_AXIS_RESULTANT];
+    resp += F("]");
     resp += F(",\"peak_hz\":");
     resp += g_fftPeakHz;
     resp += F(",\"peak_hz_filt\":");
@@ -922,6 +1139,10 @@ static void handleFftJson() {
     resp += g_fftPeakRpm;
     resp += F(",\"rpm_order\":");
     resp += g_rpmOrder;
+    resp += F(",\"manual_ref_rpm\":");
+    resp += g_manualRefRpm;
+    resp += F(",\"manual_ref_hz\":");
+    resp += getManualRefHz();
     resp += F(",\"band_min_hz\":");
     resp += g_fftBandMinHz;
     resp += F(",\"band_max_hz\":");
@@ -1128,10 +1349,39 @@ static void handleRoot() {
                 <span class="muted">Dostepne N: potegi 2 (64..max)</span>
             </div>
             <div class="cfg-row">
+                <span class="label">Analityki FFT</span>
+                <label style="font-weight:normal"><input id="anaX" type="checkbox" /> X</label>
+                <label style="font-weight:normal"><input id="anaY" type="checkbox" /> Y</label>
+                <label style="font-weight:normal"><input id="anaZ" type="checkbox" checked /> Z</label>
+                <label style="font-weight:normal"><input id="anaR" type="checkbox" /> Wypadkowa</label>
+                <span class="label" style="margin-left:8px">Oś glowna</span>
+                <select id="fftPrimaryAxis">
+                    <option value="0">X</option>
+                    <option value="1">Y</option>
+                    <option value="2" selected>Z</option>
+                    <option value="3">Wypadkowa</option>
+                </select>
+                <button id="saveFftAnalytics" type="button">Ustaw</button>
+                <span class="muted mono" id="fftAnalyticsStatus">-</span>
+                <span class="muted">Wylacz nieuzywane osie, aby zmniejszyc obciazenie CPU.</span>
+            </div>
+            <div class="cfg-row">
+                <span class="label">RPM referencyjne reczne</span>
+                <input id="manualRefRpm" type="number" min="0" max="120000" step="1" value="0" />
+                <button id="saveManualRefRpm" type="button">Ustaw</button>
+                <label style="margin-left:12px;font-weight:normal"><input type="checkbox" id="enableManualRefRpm" checked /> użyj</label>
+                <span class="muted">Marker FFT: <span class="mono" id="manualRefHz">0.00</span> Hz (odznacz = wyłącz)</span>
+            </div>
+            <div class="cfg-row">
                 <span class="label">Trend [s]</span>
                 <input id="trendSec" type="number" min="5" max="60" step="1" value="30" />
                 <button id="saveTrendSec" type="button">Ustaw</button>
                 <span class="muted">Zakres 5-60 s</span>
+            </div>
+            <div class="cfg-row">
+                <span class="label">Analiza</span>
+                <button id="resetAnalysis" type="button">Reset danych</button>
+                <span class="muted">Czyści bufor FFT, RMS i licznik probek. Ustawienia zostaja bez zmian.</span>
             </div>
         </div>
 
@@ -1144,7 +1394,7 @@ static void handleRoot() {
         <div class="card">
             <div style="font-size:.9rem;font-weight:600;color:#334155;margin-bottom:6px">Widmo FFT |a| (0 - 400 Hz)</div>
             <canvas id="fftCanvas"></canvas>
-            <p class="label">Fs=<span id="fftFs">-</span> Hz | <span id="fftRes">-</span> Hz/bin | N=<span id="fftN">-</span> | Pasmo: <span id="fftBand">-</span></p>
+            <p class="label">Fs=<span id="fftFs">-</span> Hz | <span id="fftRes">-</span> Hz/bin | N=<span id="fftN">-</span> | Pasmo: <span id="fftBand">-</span> | Oś: <span id="fftSourceLabel">-</span></p>
         </div>
     </div>
 
@@ -1182,6 +1432,7 @@ static void handleRoot() {
         let harmRatioThreshPct = 30;
         let harmWindowBins = 2;
         let trendWindowSec = 30;
+        const fftSourceLabels = ['X', 'Y', 'Z', 'Wypadkowa'];
         const trendPoints = [];
 
         const miniHelpTexts = {
@@ -1213,7 +1464,16 @@ static void handleRoot() {
             harmWinHz: 'Pelne okno analizy harmonicznej: 2 * tolerancja [Hz].',
             odrSelect: 'Konfigurowana czestotliwosc probkowania ADXL345 [Hz].',
             fftNSelect: 'Aktywna liczba probek okna FFT (N). Wieksze N = lepsza rozdzielczosc, ale wieksze opoznienie i obciazenie CPU. Uzywaj z glowa.',
+            anaX: 'Wlacza analize FFT dla osi X.',
+            anaY: 'Wlacza analize FFT dla osi Y.',
+            anaZ: 'Wlacza analize FFT dla osi Z (domyslnie aktywna po starcie).',
+            anaR: 'Wlacza analize FFT dla sygnalu wypadkowego.',
+            fftPrimaryAxis: 'Wybiera os glowna do piku/RPM i wykresu FFT.',
+            saveFftAnalytics: 'Zapisuje wlaczone analityki FFT i os glowna.',
+            manualRefRpm: 'Recznie podana predkosc obrotowa [RPM], uzywana jako referencja przy wyborze piku/fundamentalnej z FFT. 0 = brak referencji.',
+            manualRefHz: 'Czestotliwosc referencyjna [Hz] liczona z RPM i rzedu RPM.',
             trendSec: 'Zakres czasu historii trendu RMS [s], tylko przez WWW (max 60).',
+            resetAnalysis: 'Usuwa z pamieci analizowane dane i zaczyna nowa analize bez zmiany ustawien.',
             fftRes2: 'Rozdzielczosc FFT wynikajaca z bieżącego Fs i N [Hz/bin].',
             fftFs: 'Aktualne Fs analizy FFT [Hz].',
             fftRes: 'Aktualna rozdzielczosc FFT [Hz/bin].',
@@ -1254,6 +1514,51 @@ static void handleRoot() {
             if (!el) return;
             if (document.activeElement === el) return;
             el.value = valueStr;
+        }
+
+        function getAnalyticsMaskFromUi() {
+            let mask = 0;
+            if ($('anaX').checked) mask |= 1;
+            if ($('anaY').checked) mask |= 2;
+            if ($('anaZ').checked) mask |= 4;
+            if ($('anaR').checked) mask |= 8;
+            return mask;
+        }
+
+        function applyAnalyticsMaskToUi(mask) {
+            $('anaX').checked = !!(mask & 1);
+            $('anaY').checked = !!(mask & 2);
+            $('anaZ').checked = !!(mask & 4);
+            $('anaR').checked = !!(mask & 8);
+        }
+
+        async function saveFftAnalytics() {
+            const mask = getAnalyticsMaskFromUi();
+            const primary = Number($('fftPrimaryAxis').value);
+            const statusEl = $('fftAnalyticsStatus');
+            statusEl.textContent = 'Zapisywanie...';
+            statusEl.style.color = '#64748b';
+            try {
+                let r = await fetch('/api/config?fft_analytics_mask=' + mask, { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                let d = await r.json();
+                if (typeof d.fft_analytics_mask === 'number') {
+                    applyAnalyticsMaskToUi(Number(d.fft_analytics_mask));
+                }
+
+                r = await fetch('/api/config?fft_primary_axis=' + primary, { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                d = await r.json();
+                if (typeof d.fft_primary_axis === 'number') {
+                    setValueIfNotFocused('fftPrimaryAxis', String(d.fft_primary_axis));
+                    $('fftSourceLabel').textContent = fftSourceLabels[d.fft_primary_axis] || '-';
+                }
+                statusEl.textContent = 'Zapisano';
+                statusEl.style.color = '#16a34a';
+            } catch (_) {
+                statusEl.textContent = 'Blad zapisu';
+                statusEl.style.color = '#dc2626';
+            }
         }
 
         function renderTrendChart() {
@@ -1409,6 +1714,52 @@ static void handleRoot() {
             }
         }
 
+        async function saveManualReferenceRpm() {
+            const enabled = $('enableManualRefRpm').checked;
+            let val = 0;
+            if (enabled) {
+                const raw = Number($('manualRefRpm').value);
+                val = Number.isFinite(raw) ? Math.max(0, Math.min(120000, Math.round(raw))) : 0;
+            }
+            $('manualRefRpm').value = String(val);
+            try {
+                const r = await fetch('/api/config?manual_ref_rpm=' + val, { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const d = await r.json();
+                if (typeof d.manual_ref_rpm === 'number') {
+                    setValueIfNotFocused('manualRefRpm', String(Math.round(d.manual_ref_rpm)));
+                    const refHz = (d.manual_ref_rpm * (Number(d.rpm_order || 1))) / 60.0;
+                    $('manualRefHz').textContent = refHz.toFixed(2);
+                }
+            } catch (_) {
+            }
+        }
+
+        async function resetAnalysis() {
+            const btn = $('resetAnalysis');
+            const prevText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Reset...';
+            try {
+                const r = await fetch('/api/reset', { method: 'POST', cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                trendPoints.length = 0;
+                renderTrendChart();
+                $('samples').textContent = '0';
+                $('peak').textContent = '0.0 Hz';
+                $('rpm').textContent = '0';
+                $('errConf').textContent = '0';
+                $('harmStatus').textContent = 'brak';
+                $('harmStatus').style.color = '#16a34a';
+                await refreshStatus();
+                await refreshFFT();
+            } catch (_) {
+            } finally {
+                btn.disabled = false;
+                btn.textContent = prevText;
+            }
+        }
+
         async function loadConfig() {
             try {
                 const r = await fetch('/api/config', { cache: 'no-store' });
@@ -1422,6 +1773,9 @@ static void handleRoot() {
                 if (typeof d.harm_ratio_thresh_pct === 'number') {
                     harmRatioThreshPct = Number(d.harm_ratio_thresh_pct);
                     setValueIfNotFocused('harmThr', String(harmRatioThreshPct));
+                }
+                if (typeof d.manual_ref_rpm === 'number') {
+                    setValueIfNotFocused('manualRefRpm', String(Math.round(d.manual_ref_rpm)));
                 }
                 if (typeof d.harm_window_bins === 'number') {
                     harmWindowBins = Math.max(0, Math.min(32, Math.round(d.harm_window_bins)));
@@ -1442,6 +1796,13 @@ static void handleRoot() {
                 }
                 if (typeof d.fft_n === 'number') {
                     setValueIfNotFocused('fftNSelect', String(d.fft_n));
+                }
+                if (typeof d.fft_analytics_mask === 'number') {
+                    applyAnalyticsMaskToUi(Number(d.fft_analytics_mask));
+                }
+                if (typeof d.fft_primary_axis === 'number') {
+                    setValueIfNotFocused('fftPrimaryAxis', String(d.fft_primary_axis));
+                    $('fftSourceLabel').textContent = fftSourceLabels[d.fft_primary_axis] || '-';
                 }
             } catch (_) {
             }
@@ -1514,6 +1875,9 @@ static void handleRoot() {
                 $('fftRes').textContent = d.resolution.toFixed(2);
                 $('fftN').textContent = d.n;
                 $('fftBand').textContent = d.band_min_hz.toFixed(1) + '-' + d.band_max_hz.toFixed(1) + ' Hz';
+                if (typeof d.fft_primary_axis === 'number') {
+                    $('fftSourceLabel').textContent = fftSourceLabels[d.fft_primary_axis] || '-';
+                }
                 if (typeof d.fft_n === 'number') {
                     setValueIfNotFocused('fftNSelect', String(d.fft_n));
                 }
@@ -1522,6 +1886,10 @@ static void handleRoot() {
                     setValueIfNotFocused('odrSelect', String(d.fs));
                 }
                 $('fftRes2').textContent = d.resolution.toFixed(2);
+                if (typeof d.manual_ref_rpm === 'number') {
+                    setValueIfNotFocused('manualRefRpm', String(Math.round(d.manual_ref_rpm)));
+                    $('manualRefHz').textContent = Number(d.manual_ref_hz || 0).toFixed(2);
+                }
 
                 const dpr = window.devicePixelRatio || 1;
                 const W = fc.clientWidth;
@@ -1583,6 +1951,22 @@ static void handleRoot() {
                 fctx.fillStyle = '#ef4444';
                 fctx.textAlign = 'left';
                 fctx.fillText(d.peak_hz.toFixed(1) + ' Hz', Math.min(peakX + 4, W - 56), 12);
+
+                // Manual RPM reference marker.
+                if ((d.manual_ref_hz || 0) > 0 && (d.manual_ref_hz || 0) < (d.fs / 2)) {
+                    const refX = (d.manual_ref_hz / (d.fs / 2)) * W;
+                    fctx.strokeStyle = 'rgba(234,88,12,0.95)';
+                    fctx.lineWidth = 1;
+                    fctx.setLineDash([6, 3]);
+                    fctx.beginPath();
+                    fctx.moveTo(refX, 0);
+                    fctx.lineTo(refX, yBase);
+                    fctx.stroke();
+                    fctx.setLineDash([]);
+                    fctx.fillStyle = '#c2410c';
+                    fctx.textAlign = 'left';
+                    fctx.fillText('REF ' + Number(d.manual_ref_rpm || 0).toFixed(0) + ' rpm', Math.min(refX + 4, W - 94), 24);
+                }
 
                 // Harmonic markers (2x, 3x, 4x)
                 const harmAmps = d.harmonic_amps || [0, 0, 0];
@@ -1654,6 +2038,10 @@ static void handleRoot() {
         $('saveOdr').addEventListener('click', saveOdr);
         $('saveTrendSec').addEventListener('click', saveTrendWindowSec);
         $('saveFftN').addEventListener('click', saveFftN);
+        $('saveFftAnalytics').addEventListener('click', saveFftAnalytics);
+        $('saveManualRefRpm').addEventListener('click', saveManualReferenceRpm);
+        $('enableManualRefRpm').addEventListener('change', saveManualReferenceRpm);
+        $('resetAnalysis').addEventListener('click', resetAnalysis);
         $('openParamGuide').addEventListener('click', openParamGuide);
         $('closeParamGuide').addEventListener('click', closeParamGuide);
         paramGuideModal.addEventListener('click', e => {
@@ -1749,8 +2137,8 @@ void setup() {
 
     g_sensorPresent = true;
 
-    accel.setRange(ADXL345_RANGE_16_G);
-    accel.setDataRate(ADXL345_DATARATE_800_HZ);
+    accel.setRange(ADXL345_RANGE_2_G);
+    applyOdr(CONFIG_FFT_FS);
 
     Serial.printf("[ADXL] Initialized SPI: CS=%d SCK=%d MOSI=%d MISO=%d Fs=%dHz\n",
                   CONFIG_ADXL_SPI_CS_PIN,
@@ -1766,6 +2154,7 @@ void setup() {
     server.on("/api/status", HTTP_GET, handleStatusJson);
     server.on("/api/fft", HTTP_GET, handleFftJson);
     server.on("/api/config", HTTP_GET, handleConfigJson);
+    server.on("/api/reset", HTTP_POST, handleResetAnalysis);
     server.begin();
 
 #if ENABLE_MODBUS
@@ -1830,8 +2219,10 @@ void loop() {
         g_hpfPrevIn = g_lastMag;
         g_hpfPrevOut = hpOut;
 
-        g_fftReal[g_fftIdx] = hpOut;
-        g_fftImag[g_fftIdx] = 0.0f;
+        g_fftInX[g_fftIdx] = clampToI16(lroundf(g_lastX * FFT_INPUT_SCALE));
+        g_fftInY[g_fftIdx] = clampToI16(lroundf(g_lastY * FFT_INPUT_SCALE));
+        g_fftInZ[g_fftIdx] = clampToI16(lroundf(g_lastZ * FFT_INPUT_SCALE));
+        g_fftInResultant[g_fftIdx] = clampToI16(lroundf(hpOut * FFT_INPUT_SCALE));
         g_fftIdx++;
         if (g_fftIdx >= g_fftNActive) {
             g_fftIdx = 0;
