@@ -2,7 +2,7 @@
 
 ## Project Goal
 
-A motor health monitoring system based on vibration analysis. The ADXL345 accelerometer (**SPI** interface) is mounted on the motor housing and provides raw X/Y/Z acceleration data. The ESP32 (WROOM) collects 256 samples at Fs = 800 Hz, runs FFT with an HP filter and spectrum smoothing, identifies the dominant vibration frequency and estimates **RPM**. The firmware also calculates **peak confidence** (how clearly the FFT peak stands out from the noise floor). RPM is forced to `0` when peak confidence is below a configurable threshold. Results are exposed through both a built-in HTTP server and a lightweight **Modbus TCP** server. The HTTP side provides a status page plus `/api/status`, `/api/fft`, and `/api/config` JSON endpoints, while Modbus TCP serves measurement and configuration registers on port `502`. Optionally, a 1.3" OLED (SH1106, I²C) displays vibration data: RMS, dominant frequency, RPM and confidence, together with a Wi-Fi status icon (top-right), an isometric XYZ axis diagram (bottom-right), and the **GMINSTAL.PL** brand label (top-left). A dedicated error screen is shown when the ADXL345 is not detected.
+A motor health monitoring system based on vibration analysis. The ADXL345 accelerometer (**SPI** interface) is mounted on the motor housing and provides raw X/Y/Z acceleration data. The ESP32 (WROOM) collects samples at Fs = 400 Hz, runs FFT (512-point by default, up to 4096, configurable at runtime) with an HP filter and spectrum smoothing, identifies the dominant vibration frequency and estimates **RPM**. FFT runs on X, Y, Z and a resultant (HP-filtered vector magnitude) axis — the active axis set and primary axis are configurable. Harmonic amplitudes at 2×/3×/4× of the fundamental are computed and trigger dedicated alarm flags. The firmware also calculates **peak confidence** (how clearly the FFT peak stands out from the noise floor). RPM is forced to `0` when peak confidence is below a configurable threshold. Results are exposed through both a built-in HTTP server and a lightweight **Modbus TCP** server. The HTTP side provides a status page plus `/api/status`, `/api/fft`, and `/api/config` JSON endpoints, while Modbus TCP serves measurement and configuration registers on port `502`. Optionally, a 1.3" OLED (SH1106, I²C) displays vibration data: RMS, dominant frequency, RPM and confidence, together with a Wi-Fi status icon (top-right), an isometric XYZ axis diagram (bottom-right), and the **GMINSTAL.PL** brand label (top-left). A dedicated error screen is shown when the ADXL345 is not detected.
 
 ### Recent Runtime/UI Enhancements
 
@@ -68,18 +68,19 @@ I²C address: **0x3C** (configurable via `CONFIG_OLED_ADDR`).
 ┌─────────────────────────────────────────────────────┐
 │                    ESP32 (loop)                      │
 │                                                      │
-│  [Acquisition – micros()-based, Fs = 800 Hz]         │
+│  [Acquisition – micros()-based, Fs = 400 Hz]         │
 │   - ADXL345 SPI → X/Y/Z raw                         │
 │   - HP IIR filter (fc ≈ 2 Hz, removes DC/tilt)      │
-│   - circular buffer of 256 samples                  │
+│   - ring buffer up to 4096 samples (default N=512)  │
 │         │                                            │
-│  [computeFFT() – every 256 samples]                  │
+│  [computeFFT() – every N samples]                    │
 │   - Hamming window                                   │
-│   - arduinoFFT 2.x (256-point)                      │
+│   - arduinoFFT 2.x (N-point, configurable)          │
+│   - per-axis: X, Y, Z, Resultant (selectable mask)  │
 │   - spectrum smoothing (EMA between frames)          │
-│   - peak search in 5–300 Hz band                    │
-│   - parabolic interpolation (sub-bin accuracy)      │
+│   - peak search in configurable Hz band             │
 │   - peak confidence vs noise floor (0-100%)         │
+│   - harmonics at 2×/3×/4× of fundamental           │
 │   - RPM = peak_hz × 60 / order (or 0 if confidence  │
 │     is below threshold)                              │
 │         │                                            │
@@ -112,7 +113,9 @@ I²C address: **0x3C** (configurable via `CONFIG_OLED_ADDR`).
   "heap_free_bytes": 243456,
   "heap_used_bytes": 80720,
   "heap_total_bytes": 324176,
-  "cpu_pct": 6.6,
+  "rssi": -62,
+  "cpu_load_pct": 6.6,
+  "manual_ref_rpm": 0.0,
   "x": 12.3,
   "y": -4.5,
   "z": 1002.1,
@@ -158,12 +161,18 @@ Get current runtime config (currently confidence threshold):
 ```json
 {
   "peak_confidence_threshold_pct": 60,
-  "harm_ratio_thresh_pct": 20,
+  "manual_ref_rpm": 0.0,
+  "harm_ratio_thresh_pct": 30,
+  "harm_max_order": 4,
   "harm_window_bins": 2,
-  "odr_hz": 800,
+  "harm_tolerance_hz": 0.781,
+  "odr_hz": 400,
   "trend_window_sec": 30,
-  "fft_n": 256,
-  "fft_n_options": [64, 128, 256]
+  "fft_n": 512,
+  "fft_n_max": 4096,
+  "fft_analytics_mask": 4,
+  "fft_primary_axis": 2,
+  "fft_n_options": [64, 128, 256, 512, 1024, 2048, 4096]
 }
 ```
 
@@ -228,10 +237,11 @@ build_flags =
     -D CONFIG_ADXL_SPI_SCK_PIN=18
     -D CONFIG_ADXL_SPI_MOSI_PIN=23
     -D CONFIG_ADXL_SPI_MISO_PIN=19
-    -D CONFIG_ADXL_ODR=800
+    -D CONFIG_ADXL_ODR=400
     ; FFT
-    -D CONFIG_FFT_SIZE=256
-    -D CONFIG_FFT_FS=800
+    -D CONFIG_FFT_SIZE=4096
+    -D CONFIG_FFT_N_DEFAULT=512
+    -D CONFIG_FFT_FS=400
     ; Modbus TCP
     -D CONFIG_MODBUS_PORT=502
     -D CONFIG_MODBUS_UNIT_ID=1
@@ -250,7 +260,7 @@ Template: `include/secrets.h.example`.
 |---|---|
 | Measurement range | ±16 g (set in firmware) |
 | Resolution | 13 bit (full-resolution ON) |
-| Output Data Rate (ODR) | 800 Hz (`CONFIG_ADXL_ODR`) |
+| Output Data Rate (ODR) | 400 Hz (`CONFIG_ADXL_ODR`, runtime-changeable) |
 | Interface | SPI @ 5 MHz, SPI_MODE3 |
 | Supply voltage | 3.3 V |
 
@@ -285,6 +295,9 @@ Template: `include/secrets.h.example`.
 | Web UI with canvas chart (log scale) | ✅ working |
 | `/api/status` + `/api/fft` | ✅ working |
 | Modbus TCP (`FC03`, `FC04`, `FC06`) | ✅ working |
+| Harmonic analysis (2×/3×/4×, alarm flags) | ✅ working |
+| Multi-axis FFT + resultant (HP vector mag) | ✅ working |
+| Runtime ODR / FFT-N / axis mask via `/api/config` | ✅ working |
 
 ---
 
@@ -309,9 +322,9 @@ Template: `include/secrets.h.example`.
 
 ### Vibration Analysis
 - [ ] Spike detection: `|a_i| > μ + N·σ` in a rolling window
-- [ ] RMS trend analysis (60 s moving average, alarm on > 20% increase)
-- [ ] Extend FFT to vector magnitude `√(X²+Y²+Z²)` instead of a single axis
-- [ ] Monitor harmonics at 1×/2×/3× of the rotational frequency
+- [ ] RMS trend alarm (rolling average vs baseline, configurable threshold)
+- [x] FFT on resultant HP-filtered vector magnitude (`FFT_AXIS_RESULTANT`)
+- [x] Monitor harmonics at 2×/3×/4× of the rotational frequency (amplitude + alarm flags)
 - [ ] Detect bearing fault characteristic frequencies (BPFI, BPFO, BSF)
 
 ### Web UI
@@ -331,10 +344,10 @@ Template: `include/secrets.h.example`.
 ### Implementation Phases
 
 - [x] **Phase 1** – Modbus TCP server, basic raw X/Y/Z + RMS registers
-- [ ] **Phase 2** – ring-buffer, spike detection, trend analysis, alarm bits
+- [ ] **Phase 2** – spike detection, trend alarm, alarm bits 1–2
 - [x] **Phase 3** – OLED: RMS/Hz/RPM screen, Wi-Fi icon, XYZ axes diagram, branding, error screen
-- [ ] **Phase 4** – FFT extension: vector magnitude, harmonics, bearing frequencies
-- [ ] **Phase 5** – runtime threshold configuration via Modbus HR, persistence in NVS/Flash
+- [x] **Phase 4** – FFT resultant axis, harmonic detection (2×/3×/4×), runtime axis/ODR/FFT-N config
+- [ ] **Phase 5** – bearing frequencies (BPFI/BPFO/BSF), persistence in NVS/Flash
 
 ---
 
@@ -366,11 +379,15 @@ Template: `include/secrets.h.example`.
 | Bit | Meaning |
 |---|---|
 | 0 | RMS threshold exceeded (static) |
-| 1 | Impact impulse detected (spike > N×σ) |
-| 2 | Vibration trend increase > 20% in 60 s |
-| 3 | Dominant frequency outside nominal range |
+| 1 | Impact impulse detected (spike > N×σ) — *planned* |
+| 2 | Vibration trend increase > threshold — *planned* |
+| 3 | Dominant frequency outside nominal band |
 | 4 | ADXL345 communication lost |
-| 5–15 | Reserved |
+| 5 | Harmonic alarm: 2× fundamental |
+| 6 | Harmonic alarm: 3× fundamental |
+| 7 | Harmonic alarm: 4× fundamental |
+| 8 | Multiple harmonics active (≥2) |
+| 9–15 | Reserved |
 
 **Holding Registers (FC 03 / FC 06)**, base address = 100 – runtime alarm threshold configuration:
 
@@ -407,9 +424,11 @@ Parameter N (default 5) is configurable via Modbus HR 101.
 Alarm when the increase exceeds the value in HR 102 (default 20%).
 
 #### 4. FFT Analysis – Expansion
-FFT on a 256-sample window. Planned extensions:
-- vector magnitude `√(X²+Y²+Z²)` instead of a single axis
-- harmonics at 1×/2×/3× of the rotational frequency
+FFT on a configurable N-sample window (default 512, max 4096). Implemented:
+- resultant axis: HP-filtered vector magnitude `√(X²+Y²+Z²)`
+- harmonics at 2×/3×/4× of the rotational frequency (alarm flags bits 5–8)
+
+Planned:
 - bearing fault characteristic frequencies (BPFI, BPFO, BSF)
 - energy computation in diagnostic frequency bands
 
