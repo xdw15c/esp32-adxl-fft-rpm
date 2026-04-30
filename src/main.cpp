@@ -2070,6 +2070,42 @@ static void oledMsg(const char* line1, const char* line2) {
     if (line2) display.drawStr(0, 26, line2);
     display.sendBuffer();
 }
+
+// Draws a 4-bar signal-strength WiFi icon in the top-right corner (x=113..127, y=2..9).
+// Filled bars = connected; disconnected = no bars drawn for better readability.
+static void drawWifiIcon(bool connected) {
+    for (uint8_t i = 0; i < 4; i++) {
+        const uint8_t bx = 113 + i * 4u;   // 3-px bar + 1-px gap
+        const uint8_t bh = 2u + i * 2u;    // heights: 2,4,6,8
+        const uint8_t by = 10u - bh;       // align bottoms at y=9
+        if (connected) {
+            display.drawBox(bx, by, 3, bh);
+        }
+    }
+}
+
+// Draws XYZ axis arrows in the bottom-right corner (isometric style, like ADXL345 silkscreen).
+// Origin ~(112,57): X->right, Y->up, Z->diagonal up-left.
+static void drawAxesIcon() {
+    const uint8_t ox = 112, oy = 57;
+    // X axis (right)
+    display.drawLine(ox, oy, ox + 10, oy);
+    display.drawLine(ox + 10, oy, ox + 8, oy - 2);
+    display.drawLine(ox + 10, oy, ox + 8, oy + 2);
+    // Y axis (up)
+    display.drawLine(ox, oy, ox, oy - 10);
+    display.drawLine(ox, oy - 10, ox - 2, oy - 8);
+    display.drawLine(ox, oy - 10, ox + 2, oy - 8);
+    // Z axis (diagonal up-left, isometric)
+    display.drawLine(ox, oy, ox - 7, oy - 7);
+    display.drawLine(ox - 7, oy - 7, ox - 4, oy - 7);
+    display.drawLine(ox - 7, oy - 7, ox - 7, oy - 4);
+    // Labels
+    display.setFont(u8g2_font_4x6_tf);
+    display.drawStr(ox + 12, oy + 3, "X");
+    display.drawStr(ox + 2,  oy - 12, "Y");
+    display.drawStr(ox - 13, oy - 7, "Z");
+}
 #endif
 
 static void connectWiFi() {
@@ -2289,25 +2325,33 @@ void loop() {
         char buf[32];
         display.clearBuffer();
         display.setFont(u8g2_font_6x10_tf);
+        display.drawStr(0, 10, "GMINSTAL.PL");
+        drawWifiIcon(wifiStatus == WL_CONNECTED);
 #if ENABLE_ADXL
-    snprintf(buf, sizeof(buf), "X: %+6.2f", g_lastX); display.drawStr(0, 12, buf);
-    snprintf(buf, sizeof(buf), "Y: %+6.2f", g_lastY); display.drawStr(0, 24, buf);
-    snprintf(buf, sizeof(buf), "Z: %+6.2f", g_lastZ); display.drawStr(0, 36, buf);
-    snprintf(buf, sizeof(buf), "RPM: %6.0f", g_fftPeakRpm); display.drawStr(0, 48, buf);
-    if (g_harmonicAlarmFlags & 0x07u) {
-        char hbuf[16] = "HARM:";
-        if (g_harmonicAlarmFlags & 1u) strcat(hbuf, "2x");
-        if (g_harmonicAlarmFlags & 2u) strcat(hbuf, "3x");
-        if (g_harmonicAlarmFlags & 4u) strcat(hbuf, "4x");
-        display.drawStr(0, 62, hbuf);
-    } else {
-        snprintf(buf, sizeof(buf), "CONF:%5.0f%%", g_fftPeakConfidencePct); display.drawStr(0, 62, buf);
-    }
+        if (!g_sensorPresent) {
+            display.setFont(u8g2_font_7x13B_tf);
+            display.drawStr(0, 30, "BLAD ADXL345");
+            display.setFont(u8g2_font_6x10_tf);
+            display.drawStr(0, 47, "Sprawdz SPI");
+        } else {
+        snprintf(buf, sizeof(buf), "RMS: %.2f m/s2", g_rmsTotal);   display.drawStr(0, 23, buf);
+        snprintf(buf, sizeof(buf), "Hz:  %.1f",      g_fftPeakHzFilt); display.drawStr(0, 35, buf);
+        snprintf(buf, sizeof(buf), "RPM: %.0f",      g_fftPeakRpm);  display.drawStr(0, 47, buf);
+        if (g_harmonicAlarmFlags & 0x07u) {
+            char hbuf[16] = "HARM:";
+            if (g_harmonicAlarmFlags & 1u) strcat(hbuf, "2x");
+            if (g_harmonicAlarmFlags & 2u) strcat(hbuf, "3x");
+            if (g_harmonicAlarmFlags & 4u) strcat(hbuf, "4x");
+            display.drawStr(0, 62, hbuf);
+        } else {
+            snprintf(buf, sizeof(buf), "CONF: %.0f%%", g_fftPeakConfidencePct); display.drawStr(0, 62, buf);
+        }
+        }
 #else
         snprintf(buf, sizeof(buf), "heap: %u B", ESP.getFreeHeap());
-        display.drawStr(0, 12, "ESP32-C3");
         display.drawStr(0, 28, buf);
 #endif
+        drawAxesIcon();
         display.sendBuffer();
     }
 #else
