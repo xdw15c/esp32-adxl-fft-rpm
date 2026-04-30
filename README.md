@@ -2,7 +2,7 @@
 
 ## Project Goal
 
-A motor health monitoring system based on vibration analysis. The ADXL345 accelerometer (**SPI** interface) is mounted on the motor housing and provides raw X/Y/Z acceleration data. The ESP32 (WROOM) collects 256 samples at Fs = 800 Hz, runs FFT with an HP filter and spectrum smoothing, identifies the dominant vibration frequency and estimates **RPM**. The firmware also calculates **peak confidence** (how clearly the FFT peak stands out from the noise floor). RPM is forced to `0` when peak confidence is below a configurable threshold. Results are exposed through both a built-in HTTP server and a lightweight **Modbus TCP** server. The HTTP side provides a status page plus `/api/status`, `/api/fft`, and `/api/config` JSON endpoints, while Modbus TCP serves measurement and configuration registers on port `502`. Optionally, a 1.3" OLED (SH1106, I²C) displays X/Y/Z, RPM, and confidence.
+A motor health monitoring system based on vibration analysis. The ADXL345 accelerometer (**SPI** interface) is mounted on the motor housing and provides raw X/Y/Z acceleration data. The ESP32 (WROOM) collects 256 samples at Fs = 800 Hz, runs FFT with an HP filter and spectrum smoothing, identifies the dominant vibration frequency and estimates **RPM**. The firmware also calculates **peak confidence** (how clearly the FFT peak stands out from the noise floor). RPM is forced to `0` when peak confidence is below a configurable threshold. Results are exposed through both a built-in HTTP server and a lightweight **Modbus TCP** server. The HTTP side provides a status page plus `/api/status`, `/api/fft`, and `/api/config` JSON endpoints, while Modbus TCP serves measurement and configuration registers on port `502`. Optionally, a 1.3" OLED (SH1106, I²C) displays vibration data: RMS, dominant frequency, RPM and confidence, together with a Wi-Fi status icon (top-right), an isometric XYZ axis diagram (bottom-right), and the **GMINSTAL.PL** brand label (top-left). A dedicated error screen is shown when the ADXL345 is not detected.
 
 ### Recent Runtime/UI Enhancements
 
@@ -11,6 +11,14 @@ A motor health monitoring system based on vibration analysis. The ADXL345 accele
 - Runtime trend window control via `/api/config?trend_window_sec=<5..60>`.
 - Runtime FFT length selection via `/api/config?fft_n=<power_of_two>` with options returned by the API.
 - Dynamic FFT metadata in `/api/fft` (`n`, `fft_n`, `trend_window_sec`, runtime `resolution`).
+
+### OLED Enhancements (branch `oled`, merged to `main` 2026-04-30)
+
+- **GMINSTAL.PL** label in top-left corner.
+- **Wi-Fi status icon** (4-bar signal bars, top-right): filled = connected, no bars = disconnected.
+- **XYZ axis diagram** (isometric arrows, bottom-right) mirroring ADXL345 silkscreen orientation.
+- Measurement screen shows: `RMS [m/s²]`, dominant `Hz`, `RPM`, FFT confidence% (or harmonic alarm).
+- **ADXL345 error screen**: when sensor is not detected at boot, a full-screen `BLAD ADXL345 / Sprawdz SPI` message replaces measurement data.
 
 ### Dashboard Screenshot
 
@@ -85,7 +93,8 @@ I²C address: **0x3C** (configurable via `CONFIG_OLED_ADDR`).
 │   FC03/FC06 → holding registers: runtime thresholds  │
 │         │                                            │
 │  [OLED – every 120 ms, non-blocking]                │
-│   - X / Y / Z, RPM, confidence                      │
+│   - GMINSTAL.PL label + Wi-Fi icon + XYZ axes        │
+│   - RMS, peak Hz, RPM, confidence (or error screen)  │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -262,6 +271,8 @@ Template: `include/secrets.h.example`.
 |---|---|
 | ADXL345 SPI (MODE3, local lib) | ✅ working |
 | OLED SH1106 I²C (U8g2) | ✅ working |
+| OLED: WiFi icon + XYZ axes + branding | ✅ working |
+| OLED: ADXL error screen | ✅ working |
 | 800 Hz sampling (micros-based) | ✅ working |
 | FFT 256-pt, Hamming window | ✅ working |
 | HP IIR filter (dc/tilt rejection) | ✅ working |
@@ -321,7 +332,7 @@ Template: `include/secrets.h.example`.
 
 - [x] **Phase 1** – Modbus TCP server, basic raw X/Y/Z + RMS registers
 - [ ] **Phase 2** – ring-buffer, spike detection, trend analysis, alarm bits
-- [ ] **Phase 3** – OLED: additional screens (RMS, alarms, IP)
+- [x] **Phase 3** – OLED: RMS/Hz/RPM screen, Wi-Fi icon, XYZ axes diagram, branding, error screen
 - [ ] **Phase 4** – FFT extension: vector magnitude, harmonics, bearing frequencies
 - [ ] **Phase 5** – runtime threshold configuration via Modbus HR, persistence in NVS/Flash
 
